@@ -1801,22 +1801,22 @@ class TestEarthlimbDayNight:
 
     # ── daynight_mode / subsatellite ────────────────────────────────
 
-    def test_daynight_mode_default_is_limb(self, line1, line2):
-        """Default daynight_mode is 'limb'.
+    def test_daynight_mode_default_is_subsatellite(self, line1, line2):
+        """Default daynight_mode is 'subsatellite'.
 
-        The day/night split exists to model stray light from the sunlit
-        Earth, which comes from the patch the boresight grazes — so the
-        default matches the dynamic DPC wedge rather than the orbit-only
-        subsatellite test.
+        The subsatellite point is a target-independent, orbit-only solar
+        zenith angle, so every target on a given pass sees the same Earth
+        illumination.  It is also the reference for both Earth limb
+        models, so the day/night pair and the dynamic DPC wedge agree.
         """
         vis = Visibility(line1, line2)
-        assert vis.daynight_mode == "limb"
-        assert Visibility.DAYNIGHT_MODE == "limb"
-
-    def test_daynight_mode_subsatellite_stored(self, line1, line2):
-        """Custom daynight_mode='subsatellite' is stored."""
-        vis = Visibility(line1, line2, daynight_mode="subsatellite")
         assert vis.daynight_mode == "subsatellite"
+        assert Visibility.DAYNIGHT_MODE == "subsatellite"
+
+    def test_daynight_mode_limb_stored(self, line1, line2):
+        """Custom daynight_mode='limb' is stored."""
+        vis = Visibility(line1, line2, daynight_mode="limb")
+        assert vis.daynight_mode == "limb"
 
     def test_daynight_mode_invalid_raises(self, line1, line2):
         """Invalid daynight_mode raises ValueError."""
@@ -1864,6 +1864,83 @@ class TestEarthlimbDayNight:
         assert bool(result[0]) is True
         assert bool(result[1]) is False
 
+    def test_subsatellite_illumination_angle_basic(self):
+        """Subsatellite illumination is the zenith—Sun angle."""
+        zenith = np.array([0.0, 0.0, 1.0])
+        for sun, expected in [
+            (np.array([0.0, 0.0, 1.0]), 0.0),    # subsolar point
+            (np.array([1.0, 0.0, 0.0]), 90.0),   # terminator
+            (np.array([0.0, 0.0, -1.0]), 180.0), # antisolar point
+        ]:
+            assert float(
+                Visibility._subsatellite_illumination_angle(zenith, sun)
+            ) == pytest.approx(expected)
+
+    def test_subsatellite_illumination_angle_array(self):
+        """Array inputs give one angle per timestep."""
+        zenith = np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]])
+        sun = np.array([[0.0, 0.0], [0.0, 0.0], [1.0, -1.0]])
+        angles = Visibility._subsatellite_illumination_angle(zenith, sun)
+        assert angles.shape == (2,)
+        assert angles[0] == pytest.approx(0.0)
+        assert angles[1] == pytest.approx(180.0)
+
+    def test_subsatellite_illumination_agrees_with_is_sunlit(self, line1, line2,
+                                                             target_coord):
+        """< 90 deg illumination is exactly the subsatellite sunlit test."""
+        times = Time("2026-06-01T00:00:00") + np.arange(2 * 1440) * u.min
+        vis = Visibility(line1, line2)
+        pre = vis._precompute(times)
+        zen, sun = pre["zenith_unit"], pre["body_units"]["sun"]
+
+        illum = vis._subsatellite_illumination_angle(zen, sun)
+        sunlit = vis._subsatellite_is_sunlit(zen, sun)
+        # Both day and night occur in this window, so this is a real test
+        assert sunlit.any() and not sunlit.all()
+        np.testing.assert_array_equal(illum < 90.0, sunlit)
+
+    def test_daynight_illumination_angle_follows_mode(self, line1, line2):
+        """_daynight_illumination_angle dispatches on daynight_mode.
+
+        Same geometry as test_daynight_is_sunlit_follows_mode: the
+        spacecraft is over sunlit ground while the limb point toward the
+        target is dark, so the two modes must straddle 90 deg.
+        """
+        target = np.array([-1.0, 0.0, 0.0])
+        zenith = np.array([0.0, 0.0, 1.0])
+        sun = np.array([0.995, 0.0, 0.0999])  # low sun, 84 deg off zenith
+        limb_rad = np.deg2rad(21.0)
+
+        vis_sub = Visibility(line1, line2, daynight_mode="subsatellite")
+        vis_limb = Visibility(line1, line2, daynight_mode="limb")
+
+        illum_sub = float(vis_sub._daynight_illumination_angle(
+            target, zenith, sun, limb_angle_rad=limb_rad))
+        illum_limb = float(vis_limb._daynight_illumination_angle(
+            target, zenith, sun, limb_angle_rad=limb_rad))
+
+        assert illum_sub == pytest.approx(float(
+            Visibility._subsatellite_illumination_angle(zenith, sun)))
+        assert illum_limb == pytest.approx(float(
+            Visibility._get_earth_illumination_angle(
+                target, zenith, sun, limb_angle_rad=limb_rad)))
+        assert illum_sub < 90.0 < illum_limb
+
+    def test_daynight_illumination_angle_ignores_target_in_subsatellite(
+        self, line1, line2
+    ):
+        """In subsatellite mode the angle does not depend on the target."""
+        zenith = np.array([0.0, 0.0, 1.0])
+        sun = np.array([0.6, 0.0, 0.8])
+        limb_rad = np.deg2rad(21.0)
+        vis = Visibility(line1, line2, daynight_mode="subsatellite")
+        angles = {
+            float(vis._daynight_illumination_angle(
+                np.array(t, dtype=float), zenith, sun, limb_angle_rad=limb_rad))
+            for t in ([1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
+        }
+        assert len(angles) == 1
+
     def test_subsatellite_mode_differs_from_limb(self, line1, line2, target_coord):
         """subsatellite and limb modes classify day/night differently.
 
@@ -1907,19 +1984,8 @@ class TestEarthlimbDayNight:
             "day/night thresholds for at least some timesteps"
         )
 
-    def test_limb_mode_repr_omits_daynight(self, line1, line2):
-        """repr omits daynight when mode is the default 'limb'."""
-        vis = Visibility(
-            line1, line2,
-            earthlimb_day_min=25 * u.deg,
-            earthlimb_night_min=10 * u.deg,
-            daynight_mode="limb",
-        )
-        r = repr(vis)
-        assert "daynight=" not in r
-
-    def test_subsatellite_mode_repr_shows_daynight(self, line1, line2):
-        """repr shows daynight=subsatellite when mode is non-default."""
+    def test_subsatellite_mode_repr_omits_daynight(self, line1, line2):
+        """repr omits daynight when mode is the default 'subsatellite'."""
         vis = Visibility(
             line1, line2,
             earthlimb_day_min=25 * u.deg,
@@ -1927,7 +1993,18 @@ class TestEarthlimbDayNight:
             daynight_mode="subsatellite",
         )
         r = repr(vis)
-        assert "daynight=subsatellite" in r
+        assert "daynight=" not in r
+
+    def test_limb_mode_repr_shows_daynight(self, line1, line2):
+        """repr shows daynight=limb when mode is non-default."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=25 * u.deg,
+            earthlimb_night_min=10 * u.deg,
+            daynight_mode="limb",
+        )
+        r = repr(vis)
+        assert "daynight=limb" in r
 
     def test_subsatellite_no_effect_without_day_night(self, line1, line2, target_coord):
         """When day/night both None, daynight_mode makes no difference."""
@@ -2188,7 +2265,8 @@ class TestDynamicEarthlimb:
             tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
             limb_angle_rad=pre["limb_angle_rad"],
         )
-        illum = vis._get_earth_illumination_angle(
+        # Mode-aware angle: the wedge reads the daynight_mode reference point
+        illum = vis._daynight_illumination_angle(
             tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
             limb_angle_rad=pre["limb_angle_rad"],
         )
@@ -2204,6 +2282,102 @@ class TestDynamicEarthlimb:
         assert thresh.max() - thresh.min() > 1.0
         # The dark plateau is reached on the night side of every orbit
         assert np.isclose(thresh, self.DARK).any()
+
+    # —— daynight_mode interaction —————————————————————————————
+
+    def test_dynamic_honours_daynight_mode(self, line1, line2, target_coord,
+                                           test_time):
+        """The wedge reads the illumination angle at the daynight_mode point.
+
+        The dynamic curve used to always reference the nearest limb
+        point, silently ignoring daynight_mode.  It now follows it, so
+        the two modes must give different thresholds.
+        """
+        times = test_time + np.arange(3 * 1440) * u.min
+        vis_sub = Visibility(line1, line2, use_dynamic_earthlimb=True,
+                             daynight_mode="subsatellite")
+        vis_limb = Visibility(line1, line2, use_dynamic_earthlimb=True,
+                              daynight_mode="limb")
+        pre = vis_sub._precompute(times)
+        tgt_gcrs = target_coord.transform_to(GCRS(obstime=times))
+        tgt_xyz = tgt_gcrs.cartesian.xyz.value
+        tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)
+
+        args = (tgt_b, pre["zenith_unit"], pre["body_units"]["sun"])
+        kw = dict(limb_angle_rad=pre["limb_angle_rad"])
+        thresh_sub = vis_sub._effective_earthlimb_min_deg(*args, **kw)
+        thresh_limb = vis_limb._effective_earthlimb_min_deg(*args, **kw)
+
+        assert not np.allclose(thresh_sub, thresh_limb)
+        np.testing.assert_allclose(
+            thresh_sub,
+            Visibility._dynamic_earthlimb_min_deg(
+                Visibility._subsatellite_illumination_angle(
+                    pre["zenith_unit"], pre["body_units"]["sun"])
+            ),
+        )
+        # ...and the difference reaches the visibility result itself
+        assert not np.array_equal(
+            vis_sub.get_visibility(target_coord, times),
+            vis_limb.get_visibility(target_coord, times),
+        )
+
+    def test_dynamic_default_mode_is_target_independent(self, line1, line2,
+                                                        test_time):
+        """Under the default subsatellite mode the wedge ignores the target."""
+        times = test_time + np.arange(500) * u.min
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        pre = vis._precompute(times)
+        zen, sun, la = (pre["zenith_unit"], pre["body_units"]["sun"],
+                        pre["limb_angle_rad"])
+
+        thresholds = []
+        for coord in (SkyCoord(188.386, -10.1462, frame="icrs", unit="deg"),
+                      SkyCoord(270.0, -66.0, frame="icrs", unit="deg"),
+                      SkyCoord(10.0, 45.0, frame="icrs", unit="deg")):
+            xyz = coord.transform_to(GCRS(obstime=times)).cartesian.xyz.value
+            tgt_b = xyz / np.linalg.norm(xyz, axis=0, keepdims=True)
+            thresholds.append(vis._effective_earthlimb_min_deg(
+                tgt_b, zen, sun, limb_angle_rad=la))
+
+        for other in thresholds[1:]:
+            np.testing.assert_allclose(thresholds[0], other)
+
+    def test_dynamic_repr_shows_non_default_daynight(self, line1, line2):
+        """repr surfaces daynight_mode on the dynamic branch too.
+
+        The mode now changes the wedge threshold, so it must not be
+        silently omitted the way it was when it had no effect there.
+        """
+        assert "daynight=" not in repr(
+            Visibility(line1, line2, use_dynamic_earthlimb=True))
+        r = repr(Visibility(line1, line2, use_dynamic_earthlimb=True,
+                            daynight_mode="limb"))
+        assert "limb=dynamic" in r
+        assert "daynight=limb" in r
+
+    @pytest.mark.parametrize("mode", ["subsatellite", "limb"])
+    def test_dynamic_summary_matches_engine(self, line1, line2, target_coord,
+                                            test_time, mode):
+        """The illum angle summary prints is the one the wedge was fed."""
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True,
+                         daynight_mode=mode)
+        for i in range(0, 200, 20):
+            time = test_time + i * u.min
+            pre = vis._precompute(time)
+            tgt_u = vis._target_unit(target_coord, time)
+            illum = float(vis._daynight_illumination_angle(
+                tgt_u, pre["zenith_unit"], pre["body_units"]["sun"],
+                limb_angle_rad=pre["limb_angle_rad"],
+            ))
+            line = next(
+                ln for ln in vis.summary(target_coord, time).split("\n")
+                if ln.startswith("Earthlimb")
+            )
+            assert f"illum {illum:.1f}" in line, (
+                f"{mode} mode at {time.iso}: engine used {illum:.1f} deg "
+                f"but summary reported: {line.strip()}"
+            )
 
     def test_dynamic_overrides_day_night(self, line1, line2, target_coord,
                                          test_time):
@@ -2261,7 +2435,7 @@ class TestDynamicEarthlimb:
         tgt_xyz = tgt_gcrs.cartesian.xyz.value
         tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)
 
-        illum = vis._get_earth_illumination_angle(
+        illum = vis._daynight_illumination_angle(
             tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
             limb_angle_rad=pre["limb_angle_rad"],
         )
@@ -2692,9 +2866,9 @@ class TestEarthlimbRegressionSpotChecks:
         (dict(earthlimb_day_min=40 * u.deg,
               earthlimb_night_min=5 * u.deg,
               daynight_mode="limb"), 2626),
-        # mode implicit — must track the "limb" row above
+        # mode implicit — must track the "subsatellite" row above
         (dict(earthlimb_day_min=40 * u.deg,
-              earthlimb_night_min=5 * u.deg), 2626),
+              earthlimb_night_min=5 * u.deg), 2159),
         (dict(earthlimb_day_min=40 * u.deg,
               earthlimb_night_min=5 * u.deg,
               twilight_margin=18 * u.deg,
@@ -2702,7 +2876,7 @@ class TestEarthlimbRegressionSpotChecks:
         # mode implicit, with twilight margin
         (dict(earthlimb_day_min=40 * u.deg,
               earthlimb_night_min=5 * u.deg,
-              twilight_margin=18 * u.deg), 2091),
+              twilight_margin=18 * u.deg), 1768),
     ])
     def test_visible_counts_unchanged(self, times, south_target, kwargs, expected):
         """Visible-timestep counts for known configurations."""

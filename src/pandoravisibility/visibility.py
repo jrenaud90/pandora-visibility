@@ -109,13 +109,15 @@ class Visibility:
     EARTHLIMB_NIGHT_MIN = None  # None = use EARTHLIMB_MIN
     TWILIGHT_MARGIN = 0 * u.deg  # 0 = sharp terminator (current behaviour)
     USE_DYNAMIC_EARTHLIMB = False  # True = DPC wedge keep-out vs illumination angle
-    # "limb" = nearest-limb-to-target; "subsatellite" = ground below spacecraft.
-    # "limb" is the default because the stray light that motivates the day/night
-    # split comes from the patch of Earth the boresight grazes, not from the
-    # ground beneath the spacecraft.  It is also what the dynamic DPC wedge
-    # (``use_dynamic_earthlimb``) measures, so the two Earth limb models agree.
-    # Set "subsatellite" for a target-independent, orbit-only day/night split.
-    DAYNIGHT_MODE = "limb"
+    # "subsatellite" = ground below spacecraft; "limb" = nearest-limb-to-target.
+    # "subsatellite" is the default: it is a target-independent, orbit-only
+    # solar zenith angle, so every target on a given pass sees the same Earth
+    # illumination. It governs both Earth limb models, the day/night step
+    # pair (`earthlimb_day_min` / `earthlimb_night_min`) and the dynamic
+    # DPC wedge (`use_dynamic_earthlimb`), so the two can never disagree
+    # about where the reference point is. Set "limb" to reference the patch
+    # of Earth the boresight actually grazes instead.
+    DAYNIGHT_MODE = "subsatellite"
     MARS_MIN = 0 * u.deg
     JUPITER_MIN = 0 * u.deg
 
@@ -256,6 +258,10 @@ class Visibility:
             constraints.append(f"sun≥{self.sun_min:.0f}")
         if self.use_dynamic_earthlimb:
             constraints.append("limb=dynamic")
+            # The wedge curve reads the illumination angle at the
+            # daynight_mode reference point, so the mode matters here too.
+            if self.daynight_mode != self.DAYNIGHT_MODE:
+                constraints.append(f"daynight={self.daynight_mode}")
         elif self.earthlimb_day_min is not None or self.earthlimb_night_min is not None:
             day_lim = self.earthlimb_day_min if self.earthlimb_day_min is not None else self.earthlimb_min
             night_lim = self.earthlimb_night_min if self.earthlimb_night_min is not None else self.earthlimb_min
@@ -567,6 +573,10 @@ class Visibility:
         (brightest limb), 90 deg is the terminator, 180 deg is the
         antisolar point (fully dark limb).
 
+        The `daynight_mode="limb"` half of
+        `_daynight_illumination_angle`; call that instead of this to
+        respect the configured reference point.
+
         The surface normal is built exactly as in ``_earthlimb_is_sunlit``,
 
             n = cos(limb_angle) * zenith  +  sin(limb_angle) * limb_dir
@@ -696,6 +706,36 @@ class Visibility:
         dot_zs = np.sum(zenith_unit * sun_unit, axis=0)
         return dot_zs > threshold
 
+    @staticmethod
+    def _subsatellite_illumination_angle(zenith_unit, sun_unit):
+        """Earth illumination angle at the subsatellite point, in degrees.
+
+        The solar zenith angle on the ground directly below the
+        spacecraft: the angle between that point's outward surface
+        normal, which is just the observer zenith, and the direction
+        to the Sun. 0 deg is the subsolar point, 90 deg the terminator,
+        180 deg the antisolar point.
+
+        The subsatellite counterpart of
+        `_get_earth_illumination_angle`. Like that method it agrees
+        with its own sunlit test: this angle is < 90 deg
+        exactly where `_subsatellite_is_sunlit` is True at twilight.
+
+        Parameters
+        ----------
+        zenith_unit : ndarray, shape (3,) or (3, N)
+            Observer zenith direction unit vector(s).
+        sun_unit : ndarray, shape (3,) or (3, N)
+            Sun direction unit vector(s).
+
+        Returns
+        -------
+        float or ndarray
+            Illumination angle in degrees, in [0, 180].
+        """
+        dot_zs = np.sum(zenith_unit * sun_unit, axis=0)
+        return np.rad2deg(np.arccos(np.clip(dot_zs, -1.0, 1.0)))
+
     def _daynight_is_sunlit(self, target_unit, zenith_unit, sun_unit,
                             limb_angle_rad=None):
         """Whether the Earth below counts as sunlit, per ``daynight_mode``.
@@ -705,10 +745,10 @@ class Visibility:
         ``[day]``/``[night]`` label printed by ``summary`` can never
         disagree.
 
-        * ``"limb"`` (default): the nearest limb point to the target
-          direction — the patch of Earth the boresight actually grazes.
-        * ``"subsatellite"``: the ground directly below the spacecraft,
-          independent of where the boresight points.
+        * ``"subsatellite"`` (default): the ground directly below the
+          spacecraft, independent of where the boresight points.
+        * ``"limb"``: the nearest limb point to the target direction,
+          the patch of Earth the boresight actually grazes.
 
         Parameters
         ----------
@@ -739,21 +779,68 @@ class Visibility:
             twilight_margin_deg=twilight_deg,
         )
 
+    def _daynight_illumination_angle(self, target_unit, zenith_unit, sun_unit,
+                                     limb_angle_rad=None):
+        """Earth illumination angle in degrees, per `daynight_mode`.
+
+        The single source of truth for the continuous Earth
+        illumination angle, the way `_daynight_is_sunlit` is for the
+        binary day/night split. Both read the same
+        `self.daynight_mode`, so the dynamic DPC wedge
+        (`use_dynamic_earthlimb`) and the day/night step pair always
+        measure the Sun at the same point on Earth.
+
+        * `"subsatellite"` (default): the ground directly below the
+          spacecraft, independent of where the boresight points.
+        * `"limb"`: the nearest limb point to the target direction,
+          the patch of Earth the boresight actually grazes.
+
+        `twilight_margin` is deliberately not applied here. It shifts
+        a hard day/night boundary, and this angle is continuous, the
+        DPC wedge curve does its own smooth roll-off near the terminator.
+
+        Parameters
+        ----------
+        target_unit : ndarray, shape (3,) or (3, N)
+            Target direction unit vector(s) in GCRS.  Unused in
+            ``"subsatellite"`` mode.
+        zenith_unit : ndarray, shape (3,) or (3, N)
+            Observer zenith direction unit vector(s).
+        sun_unit : ndarray, shape (3,) or (3, N)
+            Sun direction unit vector(s).
+        limb_angle_rad : float or ndarray or None
+            Earth-limb half-angle in radians.  Only used in ``"limb"`` mode.
+
+        Returns
+        -------
+        float or ndarray
+            Illumination angle in degrees, in [0, 180].
+        """
+        if self.daynight_mode == "subsatellite":
+            return self._subsatellite_illumination_angle(zenith_unit, sun_unit)
+        return self._get_earth_illumination_angle(
+            target_unit, zenith_unit, sun_unit,
+            limb_angle_rad=limb_angle_rad,
+        )
+
     def _effective_earthlimb_min_deg(self, target_unit, zenith_unit, sun_unit,
                                      limb_angle_rad=None):
         """Per-timestep effective Earth limb threshold in degrees.
 
         When ``use_dynamic_earthlimb`` is True, the threshold follows the
         DPC wedge keep-out curve as a function of the Earth illumination
-        angle and everything below is bypassed.
+        angle and the day/night pair below is bypassed.
 
-        Otherwise, when ``earthlimb_day_min`` or ``earthlimb_night_min`` is set,
+        Otherwise, when `earthlimb_day_min` or `earthlimb_night_min` is set,
         returns a scalar or array of thresholds that depend on whether
-        the observer is over sunlit or shadowed Earth.  The method used
-        to determine day/night is controlled by ``self.daynight_mode``:
+        the observer is over sunlit or shadowed Earth.
 
-        * ``"limb"`` (default): nearest limb point to the target direction.
-        * ``"subsatellite"``: subsatellite point directly below spacecraft.
+        Both models take their Earth reference point from
+        `self.daynight_mode`:
+
+        * `"subsatellite"` (default): subsatellite point directly below
+          the spacecraft.
+        * `"limb"`: nearest limb point to the target direction.
 
         Otherwise returns a plain scalar from ``earthlimb_min``.
 
@@ -765,10 +852,10 @@ class Visibility:
         """
         if self.use_dynamic_earthlimb:
             # DPC wedge: continuous threshold from the illumination angle
-            # at the nearest limb point.  Takes precedence over the
-            # day/night pair.
+            # at the daynight_mode reference point. Takes precedence
+            # over the day/night pair.
             return self._dynamic_earthlimb_min_deg(
-                self._get_earth_illumination_angle(
+                self._daynight_illumination_angle(
                     target_unit, zenith_unit, sun_unit,
                     limb_angle_rad=limb_angle_rad,
                 )
@@ -2412,7 +2499,11 @@ class Visibility:
                 la_rad = pre["limb_angle_rad"]
                 tgt_u = self._target_unit(target_coord, time)
                 if self.use_dynamic_earthlimb:
-                    illum = float(self._get_earth_illumination_angle(
+                    # Must go through _daynight_illumination_angle, not
+                    # _get_earth_illumination_angle directly, so the
+                    # reported angle is measured at the same point
+                    # _effective_earthlimb_min_deg used.
+                    illum = float(self._daynight_illumination_angle(
                         tgt_u, zenith_u, sun_u, limb_angle_rad=la_rad,
                     ))
                     side = f"illum {illum:.1f}°"

@@ -1,4 +1,9 @@
-# v1.2.0 (2026-08-XX)
+# v1.2.1 (2026-08-XX)
+- `daynight_mode` now sets the Earth reference point for the dynamic DPC wedge as well as the day/night step pair. It previously applied only to the step pair: the wedge always measured the illumination angle at the nearest limb point and silently ignored the setting, so `daynight_mode` and `use_dynamic_earthlimb` together could not express a subsatellite-referenced wedge. Both Earth limb models now read the same point.
+- The default `daynight_mode` is now `"subsatellite"` to match DPC's reference point. Meaning the solar zenith angle on the ground directly below the spacecraft, which is independent of where the boresight points. Set `daynight_mode="limb"` to reference the patch of Earth the boresight actually grazes instead. The two references sit ~22-26 deg of geocentric arc apart at Pandora's altitude, so they can disagree about illumination near the terminator.
+- `repr()` now reports a non-default `daynight_mode` on the dynamic branch too, where it was previously omitted because the setting had no effect there.
+
+# v1.2.0 (2026-08-12)
 
 - Added `use_dynamic_earthlimb` (default True) to `Visibility`. When True the boresight Earth limb keep-out follows the piecewise DPC wedge curve as a function of the Earth illumination angle at the nearest limb point, instead of the fixed day/night limb limits. Star tracker keep-outs are unaffected.
     - Changed the default `daynight_mode` from `"subsatellite"` to `"limb"`. This changes results for any run that sets `earthlimb_day_min` or `earthlimb_night_min` without naming a mode. 
