@@ -1244,6 +1244,97 @@ class TestBestRoll:
             assert np.all(result["roll_deg"][valid] >= -180)
             assert np.all(result["roll_deg"][valid] <= 180)
 
+    def test_orbit_roll_matches_best_roll_where_it_chose_one(
+        self, vis_st, target_coord, test_time
+    ):
+        """get_orbit_roll_angles agrees with the roll best-roll actually used."""
+        times = test_time + np.arange(200) * u.min
+        result = vis_st.get_visibility_best_roll(target_coord, times)
+        rolls = vis_st.get_orbit_roll_angles(target_coord, times)
+
+        chosen = np.isfinite(result["roll_deg"])
+        if chosen.any():
+            np.testing.assert_allclose(rolls[chosen],
+                                       result["roll_deg"][chosen])
+
+    def test_orbit_roll_defined_where_boresight_blocked(self, target_coord):
+        """A blocked boresight still gets a roll, so the trackers can be judged.
+
+        get_visibility_best_roll skips the sweep on an orbit it could never
+        use, leaving roll_deg NaN there. get_orbit_roll_angles sweeps anyway,
+        which is what lets a diagnostic say which star tracker would have
+        failed even once the boresight was lost.
+        """
+        # A wide Sun keep-out blocks the boresight for whole orbits.
+        vis = Visibility(
+            _BR_LINE1, _BR_LINE2,
+            sun_min=170 * u.deg,
+            st_sun_min=44 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_moon_min=12 * u.deg,
+        )
+        times = Time("2025-01-01T00:00:00") + np.arange(300) * u.min
+        result = vis.get_visibility_best_roll(target_coord, times)
+        rolls = vis.get_orbit_roll_angles(target_coord, times)
+
+        assert not result["boresight_visible"].any(), "expected a blocked run"
+        assert np.all(np.isnan(result["roll_deg"]))
+        assert np.all(np.isfinite(rolls)), "every orbit should still get a roll"
+
+        # And the trackers can now be told apart there, rather than every
+        # check reading as failed because there was no attitude.
+        breakdown = vis.get_star_tracker_breakdown(
+            target_coord, times, roll=rolls * u.deg
+        )
+        for row, separation in breakdown["separations"].items():
+            assert np.all(np.isfinite(np.asarray(separation))), row
+
+    def test_orbit_roll_nan_without_star_trackers(
+        self, target_coord, test_time
+    ):
+        """With no tracker keep-outs nothing selects a roll, so it stays NaN."""
+        vis = Visibility(_BR_LINE1, _BR_LINE2)
+        times = test_time + np.arange(50) * u.min
+        assert np.all(np.isnan(vis.get_orbit_roll_angles(target_coord, times)))
+
+    def test_constraints_reconstruct_best_roll(
+        self, vis_st, target_coord, test_time
+    ):
+        """The constraint rows explain get_visibility_best_roll exactly.
+
+        Only when they are asked at the same attitude: the diagnostics
+        default to the Sun-constrained one, while a best-roll run holds a
+        single roll for a whole orbit.
+        """
+        times = test_time + np.arange(300) * u.min
+        result = vis_st.get_visibility_best_roll(target_coord, times)
+        rolls = vis_st.get_orbit_roll_angles(target_coord, times) * u.deg
+        constraints = vis_st.get_all_constraints(target_coord, times,
+                                                 roll=rolls)
+
+        rows_pass = np.ones(len(times), dtype=bool)
+        for passed in constraints.values():
+            rows_pass &= np.asarray(passed)
+        np.testing.assert_array_equal(rows_pass, result["visible"])
+
+        # The per-check breakdown reduces to the same star tracker row.
+        breakdown = vis_st.get_star_tracker_breakdown(target_coord, times,
+                                                      roll=rolls)
+        np.testing.assert_array_equal(
+            np.asarray(breakdown["passed"]["combined"]),
+            np.asarray(constraints["star_tracker"]),
+        )
+
+    def test_array_roll_length_must_match_times(
+        self, vis_st, target_coord, test_time
+    ):
+        """An array roll with the wrong length is rejected, not broadcast."""
+        times = test_time + np.arange(10) * u.min
+        with pytest.raises(ValueError, match="one entry per timestep"):
+            vis_st.get_all_constraints(
+                target_coord, times, roll=np.zeros(4) * u.deg
+            )
+
     def test_nst_range(self, vis_st, target_coord, test_time):
         """n_st_pass should be 0, 1, or 2."""
         times = test_time + np.arange(50) * u.min
