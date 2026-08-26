@@ -127,7 +127,11 @@ class Visibility:
     ST_EARTHLIMB_MIN = 0 * u.deg
     ST1_EARTHLIMB_MIN = None  # Per-tracker override (None = use ST_EARTHLIMB_MIN)
     ST2_EARTHLIMB_MIN = None  # Per-tracker override (None = use ST_EARTHLIMB_MIN)
-    ST_REQUIRED = 1  # Number of star trackers required to pass (0, 1, or 2)
+    # Number of star trackers required to pass (0, 1, or 2). Only trackers
+    # carrying an active keep-out are counted, so setting a limit on one
+    # tracker alone constrains that tracker rather than being waived by the
+    # unconstrained other one.
+    ST_REQUIRED = 1
     ROLL = None  # Spacecraft roll about boresight (None = Maximum solar power)
 
     # Ephemeris sampling. None evaluates the Sun/Moon exactly at every
@@ -1236,10 +1240,7 @@ class Visibility:
 
             tracker_results.append(tracker_ok)
 
-        if self.st_required == 1:
-            combined = tracker_results[0] | tracker_results[1]
-        else:
-            combined = tracker_results[0] & tracker_results[1]
+        combined = self._combine_tracker_results(*tracker_results)
 
         if time.isscalar:
             return bool(combined)
@@ -1438,7 +1439,8 @@ class Visibility:
                 Orbit-optimal roll angle in degrees (NaN where not visible).
                 Constant within each orbit.
             n_st_pass : int or np.ndarray
-                Number of star trackers passing at the chosen roll (0-2).
+                Number of star trackers passing at the chosen roll, counting
+                only those with an active keep-out, so 0 to 2.
             solar_power_frac : float or np.ndarray
                 Solar panel power fraction at the chosen roll (NaN if not
                 visible).
@@ -1648,16 +1650,17 @@ class Visibility:
                     continue
                 t2_ok &= sep >= lim
 
-            if self.st_required == 1:
-                st_ok_inp = t1_ok | t2_ok
-            else:
-                st_ok_inp = t1_ok & t2_ok
+            st_ok_inp = self._combine_tracker_results(t1_ok, t2_ok)
 
             vis_inp = bs_inp & st_ok_inp
             out_visible[idx] = vis_inp
-            out_nst[idx] = np.where(
-                vis_inp, t1_ok.astype(int) + t2_ok.astype(int), 0
+            # Count only the trackers something was asked of, to match the
+            # rule _combine_tracker_results applies just above.
+            passing = sum(
+                (t1_ok if tracker == 1 else t2_ok).astype(int)
+                for tracker in self._trackers_with_checks()
             )
+            out_nst[idx] = np.where(vis_inp, passing, 0)
 
             # Solar power at input times
             cos_sy = np.sum(y_pay[:, np.newaxis] * bu_inp["sun"], axis=0)
@@ -1824,6 +1827,48 @@ class Visibility:
             if self._st_earthlimb_min_for(t) > 0 * u.deg:
                 return True
         return False
+
+    def _trackers_with_checks(self) -> list:
+        """Tracker numbers carrying at least one active keep-out.
+
+        A tracker with an empty check list is not modelled at all rather
+        than modelled as unconstrained, which is what keeps it out of the
+        ``st_required`` count in ``_combine_tracker_results``.
+        """
+        return [tracker for tracker in (1, 2)
+                if self._st_checks_for(tracker)]
+
+    def _combine_tracker_results(self, st1_ok, st2_ok):
+        """Reduce the two tracker verdicts to the ``st_required`` answer.
+
+        The one place ``st_required`` is applied, so the constraint check,
+        the breakdown and both roll searches cannot disagree about what it
+        means.
+
+        A tracker with no active keep-out is left out of the count instead
+        of counting as a pass. Otherwise "at least one tracker" would be
+        satisfied by a tracker nothing was ever asked of, and a per-tracker
+        limit set on its own, ``st1_earthlimb_min`` with nothing for ST2,
+        would silently reject nothing. With ``st_required=2`` this changes
+        no result, since ANDing against an always-passing tracker already
+        reduced to the constrained one.
+
+        Parameters
+        ----------
+        st1_ok, st2_ok : bool or np.ndarray of bool
+            Whether each tracker met all of its own active keep-outs.
+
+        Returns
+        -------
+        bool or np.ndarray of bool
+            Whether the star tracker requirement is met.
+        """
+        active = self._trackers_with_checks()
+        if len(active) == 1:
+            return st1_ok if active[0] == 1 else st2_ok
+        if self.st_required == 1:
+            return st1_ok | st2_ok
+        return st1_ok & st2_ok
 
     def _st_earthlimb_min_for(self, tracker: int):
         """Effective Earth limb keep-out for a specific tracker.
@@ -2054,10 +2099,7 @@ class Visibility:
             )
             for tracker in (1, 2)
         ]
-        if self.st_required == 1:
-            st_ok = tracker_ok[0] | tracker_ok[1]
-        else:
-            st_ok = tracker_ok[0] & tracker_ok[1]
+        st_ok = self._combine_tracker_results(*tracker_ok)
 
         cos_sy = np.clip(
             np.sum(
@@ -2541,10 +2583,10 @@ class Visibility:
             )
         elif time.isscalar and degenerate:
             passed["combined"] = False
-        elif self.st_required == 1:
-            passed["combined"] = tracker_overall[1] | tracker_overall[2]
         else:
-            passed["combined"] = tracker_overall[1] & tracker_overall[2]
+            passed["combined"] = self._combine_tracker_results(
+                tracker_overall[1], tracker_overall[2]
+            )
 
         return {
             "passed": passed,

@@ -860,6 +860,71 @@ class TestStarTrackerConstraints:
         with pytest.raises(ValueError, match="st_required must be 0, 1, or 2"):
             Visibility(line1, line2, st_required=3)
 
+    def test_single_tracker_limit_is_not_waived_by_the_other(
+        self, line1, line2, target_coord
+    ):
+        """A keep-out set on one tracker alone still rejects steps.
+
+        st_required=1 used to be satisfied by the unconstrained tracker,
+        which passed everything by default, so st1_earthlimb_min on its own
+        rejected nothing at all.
+        """
+        times = Time("2026-03-01T00:00:00") + np.arange(0, 1440, 10) * u.min
+        vis = Visibility(line1, line2, st1_earthlimb_min=30 * u.deg,
+                         st_required=1)
+        assert vis._trackers_with_checks() == [1]
+
+        passed = np.asarray(
+            vis.get_star_tracker_constraint(target_coord, times)
+        )
+        assert not passed.all(), "the limit should reject something"
+
+        # Nothing was asked of ST2, so the verdict is ST1's own.
+        breakdown = vis.get_star_tracker_breakdown(target_coord, times)
+        np.testing.assert_array_equal(
+            passed, np.asarray(breakdown["passed"]["ST1"])
+        )
+
+    def test_single_tracker_limit_ignores_st_required(
+        self, line1, line2, target_coord
+    ):
+        """With one tracker constrained, st_required 1 and 2 agree."""
+        times = Time("2026-03-01T00:00:00") + np.arange(0, 1440, 10) * u.min
+        one = Visibility(line1, line2, st2_earthlimb_min=30 * u.deg,
+                         st_required=1)
+        two = Visibility(line1, line2, st2_earthlimb_min=30 * u.deg,
+                         st_required=2)
+        np.testing.assert_array_equal(
+            np.asarray(one.get_star_tracker_constraint(target_coord, times)),
+            np.asarray(two.get_star_tracker_constraint(target_coord, times)),
+        )
+
+    def test_two_constrained_trackers_still_or_together(
+        self, breakdown_vis, target_coord
+    ):
+        """With both trackers constrained, st_required=1 is unchanged."""
+        times = Time("2026-03-01T00:00:00") + np.arange(0, 1440, 10) * u.min
+        assert breakdown_vis._trackers_with_checks() == [1, 2]
+        breakdown = breakdown_vis.get_star_tracker_breakdown(
+            target_coord, times
+        )
+        np.testing.assert_array_equal(
+            np.asarray(breakdown["passed"]["combined"]),
+            np.asarray(breakdown["passed"]["ST1"])
+            | np.asarray(breakdown["passed"]["ST2"]),
+        )
+
+    def test_nst_pass_ignores_an_unconstrained_tracker(
+        self, line1, line2, target_coord
+    ):
+        """n_st_pass counts only the trackers something was asked of."""
+        times = Time("2026-03-01T00:00:00") + np.arange(0, 1440, 10) * u.min
+        vis = Visibility(line1, line2, st1_earthlimb_min=30 * u.deg,
+                         st_required=1)
+        result = vis.get_visibility_best_roll(target_coord, times)
+        assert result["visible"].any(), "expected some visible steps"
+        assert result["n_st_pass"].max() <= 1
+
     def test_repr_shows_st_required(self, line1, line2):
         """__repr__ includes st_req when ST constraints are active."""
         vis = Visibility(line1, line2, st_sun_min=45 * u.deg, st_required=2)
