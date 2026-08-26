@@ -872,6 +872,62 @@ class TestStarTrackerConstraints:
         summary = vis.summary(target_coord, test_time)
         assert "both" in summary
 
+    def test_star_tracker_angles_match_the_applied_limb_angle(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """The reported limb angle is the one the constraint applies.
+
+        get_star_tracker_angles used an AltAz altitude, measured from the
+        geodetic horizon, while the check uses a geocentric one. The two
+        sit up to ~0.2 deg apart, enough to disagree about a tracker near
+        its limit.
+        """
+        times = test_time + np.arange(200) * u.min
+        breakdown = breakdown_vis.get_star_tracker_breakdown(
+            target_coord, times
+        )
+        for tracker in (1, 2):
+            reported = breakdown_vis.get_star_tracker_angles(
+                target_coord, times, tracker
+            )["earthlimb_angle"].to(u.deg).value
+            applied = np.asarray(breakdown["separations"][f"ST{tracker} limb"])
+            np.testing.assert_allclose(reported, applied, atol=1e-3)
+
+    def test_summary_star_tracker_rows_agree_with_result(
+        self, line1, line2, target_coord
+    ):
+        """summary() cannot show every tracker failing above a passing result.
+
+        The rows came from get_star_tracker_angles and the result from the
+        geocentric check, so at this step the two disagreed and the section
+        printed ST1 FAIL, ST2 FAIL, Result PASS.
+        """
+        vis = Visibility(line1, line2, st_earthlimb_min=15 * u.deg,
+                         st_required=1)
+        summary = vis.summary(target_coord, Time("2026-03-01T02:36:30.000"))
+
+        verdicts = {}
+        for line in summary.splitlines():
+            stripped = line.strip()
+            for row in ("ST1", "ST2", "Result"):
+                if stripped.startswith(row):
+                    verdicts[row] = "PASS" in stripped
+        assert set(verdicts) == {"ST1", "ST2", "Result"}, summary
+        assert verdicts["Result"] == (verdicts["ST1"] or verdicts["ST2"]), summary
+
+    def test_summary_rows_agree_with_result_over_a_day(
+        self, breakdown_vis, target_coord
+    ):
+        """The same agreement holds across a day, not just at one step."""
+        times = Time("2026-03-01T00:00:00") + np.arange(0, 1440, 10) * u.min
+        breakdown = breakdown_vis.get_star_tracker_breakdown(
+            target_coord, times
+        )
+        st1 = np.asarray(breakdown["passed"]["ST1"])
+        st2 = np.asarray(breakdown["passed"]["ST2"])
+        combined = np.asarray(breakdown["passed"]["combined"])
+        np.testing.assert_array_equal(combined, st1 | st2)
+
 
 class TestRollParameter:
     """Tests for the configurable roll parameter."""

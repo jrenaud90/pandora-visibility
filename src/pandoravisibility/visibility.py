@@ -1,7 +1,7 @@
 import numpy as np
 from astropy import units as u
 from astropy.constants import R_earth
-from astropy.coordinates import GCRS, TEME, AltAz, EarthLocation, SkyCoord, get_body
+from astropy.coordinates import GCRS, TEME, EarthLocation, SkyCoord, get_body
 from astropy.time import Time
 from sgp4.api import SGP4_ERRORS, Satrec
 
@@ -1812,39 +1812,6 @@ class Visibility:
 
         return float(out_roll[0]) if is_scalar else out_roll
 
-    @staticmethod
-    def _get_angle_from_earth_limb(
-        observer_location: EarthLocation, target_coord: SkyCoord, obstime: Time
-    ) -> u.Quantity:
-        """
-        Calculate the angular distance from the Earth's limb to the target.
-
-        Parameters:
-        observer_location : EarthLocation
-            The observer's location on the Earth.
-        target_coord : SkyCoord
-            The target coordinate to compute the angle for.
-        obstime : Time
-            The observation time.
-
-        Returns:
-        u.Quantity
-            The angular distance in degrees.
-        """
-        # Convert target coordinate to the AltAz frame
-        altaz = target_coord.transform_to(
-            AltAz(location=observer_location, obstime=obstime)
-        )
-        alt = altaz.alt
-
-        # Calculate the angular radius of the Earth's limb
-        x, y, z = observer_location.geocentric
-        observer_distance = np.sqrt(np.square(x) + np.square(y) + np.square(z))
-        with np.errstate(invalid="ignore"):
-            limb_angle = np.arccos(R_earth / observer_distance)
-
-        return alt + limb_angle
-
     @property
     def _st_constraint_active(self) -> bool:
         """Whether any star tracker constraints are active."""
@@ -2243,10 +2210,21 @@ class Visibility:
         )
         earth_angle = st_coord.separation(earth_coord)
 
-        # Earth limb angle
-        earthlimb_angle = self._get_angle_from_earth_limb(
-            observer_location, st_coord, time
-        )
+        # Earth limb angle, geocentric like the constraint check, so this
+        # reports the number get_star_tracker_constraint applies rather
+        # than one that merely resembles it. An AltAz altitude is measured
+        # from the geodetic horizon, which sits up to ~0.2 deg away from
+        # the geocentric one, enough to disagree about a tracker sitting
+        # near its limit.
+        pre = self._precompute(time)
+        st_xyz = st_coord.cartesian.xyz.value
+        if time.isscalar:
+            st_unit = st_xyz / np.linalg.norm(st_xyz)
+        else:
+            st_unit = st_xyz / np.linalg.norm(st_xyz, axis=0, keepdims=True)
+        earthlimb_angle = self._fast_limb_deg(
+            st_unit, pre["zenith_unit"], pre["limb_angle_rad"]
+        ) * u.deg
 
         return {
             "ra": st_coord.spherical.lon.to(u.deg),
@@ -2760,28 +2738,35 @@ class Visibility:
                 f"Star Tracker Constraints (need {req_label} tracker passing):"
             )
 
-            for tracker in [1, 2]:
-                try:
-                    angles = self.get_star_tracker_angles(target_coord, time, tracker)
-                    tracker_pass = True
-                    details = []
-                    for name, limit, key in self._st_checks_for(tracker):
-                        actual = angles[key]
-                        ok = bool(actual >= limit)
-                        tracker_pass = tracker_pass and ok
-                        sym = "✓" if ok else "✗"
-                        details.append(
-                            f"{name}:{sym} req:{limit:>6.1f} act:{actual:>6.1f}"
-                        )
-                    symbol = "✓" if tracker_pass else "✗"
-                    status = "PASS" if tracker_pass else "FAIL"
-                    lines.append(f"  ST{tracker:<8}{symbol} {status}")
-                    for d in details:
-                        lines.append(f"    {d}")
-                except ValueError as e:
-                    lines.append(f"  ST{tracker:<8}✗ ERROR ({e})")
+            # Rows and result both come from the breakdown, which shares
+            # its geometry with the constraint check itself. Deriving the
+            # rows from get_star_tracker_angles let them contradict the
+            # result printed underneath, because that reported an AltAz
+            # limb angle while the check applied a geocentric one.
+            breakdown = self.get_star_tracker_breakdown(target_coord, time)
 
-            st_combined = self.get_star_tracker_constraint(target_coord, time)
+            for tracker in [1, 2]:
+                tracker_pass = breakdown["passed"][f"ST{tracker}"]
+                symbol = "✓" if tracker_pass else "✗"
+                status = "PASS" if tracker_pass else "FAIL"
+                lines.append(f"  ST{tracker:<8}{symbol} {status}")
+
+                for name, limit, _ in self._st_checks_for(tracker):
+                    row = f"ST{tracker} {name}"
+                    sym = "✓" if breakdown["passed"][row] else "✗"
+                    actual = breakdown["separations"][row]
+                    # NaN means the attitude itself is undefined, which
+                    # happens when the target lies along the Sun and
+                    # Sun x Z stops defining a payload +Y.
+                    shown = (
+                        "  undefined" if np.isnan(actual)
+                        else f"{actual * u.deg:>6.1f}"
+                    )
+                    lines.append(
+                        f"    {name}:{sym} req:{limit:>6.1f} act:{shown}"
+                    )
+
+            st_combined = breakdown["passed"]["combined"]
             st_sym = "✓" if st_combined else "✗"
             st_stat = "PASS" if st_combined else "FAIL"
             lines.append(f"  {'Result':<9}{st_sym} {st_stat}")
