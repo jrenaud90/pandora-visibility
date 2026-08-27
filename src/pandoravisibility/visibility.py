@@ -102,13 +102,16 @@ class Visibility:
     """
 
     # Default constants - can be overridden per instance
-    MOON_MIN = 25 * u.deg
+    MOON_MIN = 20 * u.deg
     SUN_MIN = 91 * u.deg
     EARTHLIMB_MIN = 20 * u.deg
-    EARTHLIMB_DAY_MIN = None    # None = use EARTHLIMB_MIN
-    EARTHLIMB_NIGHT_MIN = None  # None = use EARTHLIMB_MIN
+    # Day/night pair, used when use_dynamic_earthlimb is False. The dynamic
+    # DPC wedge takes precedence over these, so on the defaults below they
+    # are the fallback rather than the active limits.
+    EARTHLIMB_DAY_MIN = 44 * u.deg    # None = use EARTHLIMB_MIN
+    EARTHLIMB_NIGHT_MIN = 13 * u.deg  # None = use EARTHLIMB_MIN
     TWILIGHT_MARGIN = 0 * u.deg  # 0 = sharp terminator (current behaviour)
-    USE_DYNAMIC_EARTHLIMB = False  # True = DPC wedge keep-out vs illumination angle
+    USE_DYNAMIC_EARTHLIMB = True  # True = DPC wedge keep-out vs illumination angle
     # "subsatellite" = ground below spacecraft; "limb" = nearest-limb-to-target.
     # "subsatellite" is the default: it is a target-independent, orbit-only
     # solar zenith angle, so every target on a given pass sees the same Earth
@@ -122,9 +125,9 @@ class Visibility:
     JUPITER_MIN = 0 * u.deg
 
     # Star tracker keep-out defaults (0 = disabled)
-    ST_SUN_MIN = 0 * u.deg
-    ST_MOON_MIN = 0 * u.deg
-    ST_EARTHLIMB_MIN = 0 * u.deg
+    ST_SUN_MIN = 50 * u.deg
+    ST_MOON_MIN = 20 * u.deg
+    ST_EARTHLIMB_MIN = 30 * u.deg
     ST1_EARTHLIMB_MIN = None  # Per-tracker override (None = use ST_EARTHLIMB_MIN)
     ST2_EARTHLIMB_MIN = None  # Per-tracker override (None = use ST_EARTHLIMB_MIN)
     # Number of star trackers required to pass (0, 1, or 2). Only trackers

@@ -1,7 +1,21 @@
 import numpy as np
+from astropy import units as u
 from packaging import version
 
 from pandoravisibility import Visibility
+
+# The class defaults carry Pandora's flight keep-outs from v1.3.0.  These
+# counts predate that, so they name the older, simpler configuration rather
+# than tracking whatever the defaults become next.
+_LEGACY_DEFAULTS = dict(
+    moon_min=25 * u.deg,
+    earthlimb_day_min=None,
+    earthlimb_night_min=None,
+    use_dynamic_earthlimb=False,
+    st_sun_min=0 * u.deg,
+    st_moon_min=0 * u.deg,
+    st_earthlimb_min=0 * u.deg,
+)
 
 
 def test_numpy_compatibility():
@@ -52,7 +66,7 @@ def test_target():
     line1 = "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
     line2 = "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
 
-    vis = Visibility(line1, line2)
+    vis = Visibility(line1, line2, **_LEGACY_DEFAULTS)
 
     from astropy.time import Time, TimeDelta
 
@@ -86,7 +100,7 @@ def test_custom_limits():
     vis = Visibility(
         line1,
         line2,
-        moon_min=20 * u.deg,
+        **{**_LEGACY_DEFAULTS, "moon_min": 20 * u.deg},
         earthlimb_min=10 * u.deg,
         sun_min=90 * u.deg,
         jupiter_min=0 * u.deg,
@@ -128,7 +142,9 @@ def test_edge_cases():
 
     # Test with zero constraints
     vis_zero = Visibility(
-        line1, line2, moon_min=0 * u.deg, sun_min=0 * u.deg, earthlimb_min=-90 * u.deg
+        line1, line2,
+        **{**_LEGACY_DEFAULTS, "moon_min": 0 * u.deg, "sun_min": 0 * u.deg,
+           "earthlimb_min": -90 * u.deg},
     )
     result = vis_zero.get_visibility(target_coord, time)
     assert isinstance(result, bool)
