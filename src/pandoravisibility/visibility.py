@@ -1,7 +1,7 @@
 import numpy as np
 from astropy import units as u
 from astropy.constants import R_earth
-from astropy.coordinates import GCRS, TEME, AltAz, EarthLocation, SkyCoord, get_body
+from astropy.coordinates import GCRS, TEME, EarthLocation, SkyCoord, get_body
 from astropy.time import Time
 from sgp4.api import SGP4_ERRORS, Satrec
 
@@ -102,30 +102,39 @@ class Visibility:
     """
 
     # Default constants - can be overridden per instance
-    MOON_MIN = 25 * u.deg
+    MOON_MIN = 20 * u.deg
     SUN_MIN = 91 * u.deg
     EARTHLIMB_MIN = 20 * u.deg
-    EARTHLIMB_DAY_MIN = None    # None = use EARTHLIMB_MIN
-    EARTHLIMB_NIGHT_MIN = None  # None = use EARTHLIMB_MIN
+    # Day/night pair, used when use_dynamic_earthlimb is False. The dynamic
+    # DPC wedge takes precedence over these, so on the defaults below they
+    # are the fallback rather than the active limits.
+    EARTHLIMB_DAY_MIN = 44 * u.deg    # None = use EARTHLIMB_MIN
+    EARTHLIMB_NIGHT_MIN = 13 * u.deg  # None = use EARTHLIMB_MIN
     TWILIGHT_MARGIN = 0 * u.deg  # 0 = sharp terminator (current behaviour)
-    USE_DYNAMIC_EARTHLIMB = False  # True = DPC wedge keep-out vs illumination angle
-    # "limb" = nearest-limb-to-target; "subsatellite" = ground below spacecraft.
-    # "limb" is the default because the stray light that motivates the day/night
-    # split comes from the patch of Earth the boresight grazes, not from the
-    # ground beneath the spacecraft.  It is also what the dynamic DPC wedge
-    # (``use_dynamic_earthlimb``) measures, so the two Earth limb models agree.
-    # Set "subsatellite" for a target-independent, orbit-only day/night split.
-    DAYNIGHT_MODE = "limb"
+    USE_DYNAMIC_EARTHLIMB = True  # True = DPC wedge keep-out vs illumination angle
+    # "subsatellite" = ground below spacecraft; "limb" = nearest-limb-to-target.
+    # "subsatellite" is the default: it is a target-independent, orbit-only
+    # solar zenith angle, so every target on a given pass sees the same Earth
+    # illumination. It governs both Earth limb models, the day/night step
+    # pair (`earthlimb_day_min` / `earthlimb_night_min`) and the dynamic
+    # DPC wedge (`use_dynamic_earthlimb`), so the two can never disagree
+    # about where the reference point is. Set "limb" to reference the patch
+    # of Earth the boresight actually grazes instead.
+    DAYNIGHT_MODE = "subsatellite"
     MARS_MIN = 0 * u.deg
     JUPITER_MIN = 0 * u.deg
 
     # Star tracker keep-out defaults (0 = disabled)
-    ST_SUN_MIN = 0 * u.deg
-    ST_MOON_MIN = 0 * u.deg
-    ST_EARTHLIMB_MIN = 0 * u.deg
+    ST_SUN_MIN = 50 * u.deg
+    ST_MOON_MIN = 20 * u.deg
+    ST_EARTHLIMB_MIN = 30 * u.deg
     ST1_EARTHLIMB_MIN = None  # Per-tracker override (None = use ST_EARTHLIMB_MIN)
     ST2_EARTHLIMB_MIN = None  # Per-tracker override (None = use ST_EARTHLIMB_MIN)
-    ST_REQUIRED = 1  # Number of star trackers required to pass (0, 1, or 2)
+    # Number of star trackers required to pass (0, 1, or 2). Only trackers
+    # carrying an active keep-out are counted, so setting a limit on one
+    # tracker alone constrains that tracker rather than being waived by the
+    # unconstrained other one.
+    ST_REQUIRED = 1
     ROLL = None  # Spacecraft roll about boresight (None = Maximum solar power)
 
     # Ephemeris sampling. None evaluates the Sun/Moon exactly at every
@@ -256,6 +265,10 @@ class Visibility:
             constraints.append(f"sun≥{self.sun_min:.0f}")
         if self.use_dynamic_earthlimb:
             constraints.append("limb=dynamic")
+            # The wedge curve reads the illumination angle at the
+            # daynight_mode reference point, so the mode matters here too.
+            if self.daynight_mode != self.DAYNIGHT_MODE:
+                constraints.append(f"daynight={self.daynight_mode}")
         elif self.earthlimb_day_min is not None or self.earthlimb_night_min is not None:
             day_lim = self.earthlimb_day_min if self.earthlimb_day_min is not None else self.earthlimb_min
             night_lim = self.earthlimb_night_min if self.earthlimb_night_min is not None else self.earthlimb_min
@@ -567,6 +580,10 @@ class Visibility:
         (brightest limb), 90 deg is the terminator, 180 deg is the
         antisolar point (fully dark limb).
 
+        The `daynight_mode="limb"` half of
+        `_daynight_illumination_angle`; call that instead of this to
+        respect the configured reference point.
+
         The surface normal is built exactly as in ``_earthlimb_is_sunlit``,
 
             n = cos(limb_angle) * zenith  +  sin(limb_angle) * limb_dir
@@ -696,6 +713,36 @@ class Visibility:
         dot_zs = np.sum(zenith_unit * sun_unit, axis=0)
         return dot_zs > threshold
 
+    @staticmethod
+    def _subsatellite_illumination_angle(zenith_unit, sun_unit):
+        """Earth illumination angle at the subsatellite point, in degrees.
+
+        The solar zenith angle on the ground directly below the
+        spacecraft: the angle between that point's outward surface
+        normal, which is just the observer zenith, and the direction
+        to the Sun. 0 deg is the subsolar point, 90 deg the terminator,
+        180 deg the antisolar point.
+
+        The subsatellite counterpart of
+        `_get_earth_illumination_angle`. Like that method it agrees
+        with its own sunlit test: this angle is < 90 deg
+        exactly where `_subsatellite_is_sunlit` is True at twilight.
+
+        Parameters
+        ----------
+        zenith_unit : ndarray, shape (3,) or (3, N)
+            Observer zenith direction unit vector(s).
+        sun_unit : ndarray, shape (3,) or (3, N)
+            Sun direction unit vector(s).
+
+        Returns
+        -------
+        float or ndarray
+            Illumination angle in degrees, in [0, 180].
+        """
+        dot_zs = np.sum(zenith_unit * sun_unit, axis=0)
+        return np.rad2deg(np.arccos(np.clip(dot_zs, -1.0, 1.0)))
+
     def _daynight_is_sunlit(self, target_unit, zenith_unit, sun_unit,
                             limb_angle_rad=None):
         """Whether the Earth below counts as sunlit, per ``daynight_mode``.
@@ -705,10 +752,10 @@ class Visibility:
         ``[day]``/``[night]`` label printed by ``summary`` can never
         disagree.
 
-        * ``"limb"`` (default): the nearest limb point to the target
-          direction — the patch of Earth the boresight actually grazes.
-        * ``"subsatellite"``: the ground directly below the spacecraft,
-          independent of where the boresight points.
+        * ``"subsatellite"`` (default): the ground directly below the
+          spacecraft, independent of where the boresight points.
+        * ``"limb"``: the nearest limb point to the target direction,
+          the patch of Earth the boresight actually grazes.
 
         Parameters
         ----------
@@ -739,21 +786,68 @@ class Visibility:
             twilight_margin_deg=twilight_deg,
         )
 
+    def _daynight_illumination_angle(self, target_unit, zenith_unit, sun_unit,
+                                     limb_angle_rad=None):
+        """Earth illumination angle in degrees, per `daynight_mode`.
+
+        The single source of truth for the continuous Earth
+        illumination angle, the way `_daynight_is_sunlit` is for the
+        binary day/night split. Both read the same
+        `self.daynight_mode`, so the dynamic DPC wedge
+        (`use_dynamic_earthlimb`) and the day/night step pair always
+        measure the Sun at the same point on Earth.
+
+        * `"subsatellite"` (default): the ground directly below the
+          spacecraft, independent of where the boresight points.
+        * `"limb"`: the nearest limb point to the target direction,
+          the patch of Earth the boresight actually grazes.
+
+        `twilight_margin` is deliberately not applied here. It shifts
+        a hard day/night boundary, and this angle is continuous, the
+        DPC wedge curve does its own smooth roll-off near the terminator.
+
+        Parameters
+        ----------
+        target_unit : ndarray, shape (3,) or (3, N)
+            Target direction unit vector(s) in GCRS.  Unused in
+            ``"subsatellite"`` mode.
+        zenith_unit : ndarray, shape (3,) or (3, N)
+            Observer zenith direction unit vector(s).
+        sun_unit : ndarray, shape (3,) or (3, N)
+            Sun direction unit vector(s).
+        limb_angle_rad : float or ndarray or None
+            Earth-limb half-angle in radians.  Only used in ``"limb"`` mode.
+
+        Returns
+        -------
+        float or ndarray
+            Illumination angle in degrees, in [0, 180].
+        """
+        if self.daynight_mode == "subsatellite":
+            return self._subsatellite_illumination_angle(zenith_unit, sun_unit)
+        return self._get_earth_illumination_angle(
+            target_unit, zenith_unit, sun_unit,
+            limb_angle_rad=limb_angle_rad,
+        )
+
     def _effective_earthlimb_min_deg(self, target_unit, zenith_unit, sun_unit,
                                      limb_angle_rad=None):
         """Per-timestep effective Earth limb threshold in degrees.
 
         When ``use_dynamic_earthlimb`` is True, the threshold follows the
         DPC wedge keep-out curve as a function of the Earth illumination
-        angle and everything below is bypassed.
+        angle and the day/night pair below is bypassed.
 
-        Otherwise, when ``earthlimb_day_min`` or ``earthlimb_night_min`` is set,
+        Otherwise, when `earthlimb_day_min` or `earthlimb_night_min` is set,
         returns a scalar or array of thresholds that depend on whether
-        the observer is over sunlit or shadowed Earth.  The method used
-        to determine day/night is controlled by ``self.daynight_mode``:
+        the observer is over sunlit or shadowed Earth.
 
-        * ``"limb"`` (default): nearest limb point to the target direction.
-        * ``"subsatellite"``: subsatellite point directly below spacecraft.
+        Both models take their Earth reference point from
+        `self.daynight_mode`:
+
+        * `"subsatellite"` (default): subsatellite point directly below
+          the spacecraft.
+        * `"limb"`: nearest limb point to the target direction.
 
         Otherwise returns a plain scalar from ``earthlimb_min``.
 
@@ -765,10 +859,10 @@ class Visibility:
         """
         if self.use_dynamic_earthlimb:
             # DPC wedge: continuous threshold from the illumination angle
-            # at the nearest limb point.  Takes precedence over the
-            # day/night pair.
+            # at the daynight_mode reference point. Takes precedence
+            # over the day/night pair.
             return self._dynamic_earthlimb_min_deg(
-                self._get_earth_illumination_angle(
+                self._daynight_illumination_angle(
                     target_unit, zenith_unit, sun_unit,
                     limb_angle_rad=limb_angle_rad,
                 )
@@ -1000,7 +1094,9 @@ class Visibility:
         pre : dict
             Precomputed data from ``_precompute()``.
         effective_roll : Quantity or None
-            Roll angle to use.  If ``None``, falls back to ``self.roll``.
+            Roll angle to use.  Scalar, or one angle per timestep to
+            evaluate a changing attitude, as ``get_visibility_best_roll``
+            returns.  If ``None``, falls back to ``self.roll``.
 
         Returns
         -------
@@ -1021,17 +1117,39 @@ class Visibility:
 
         # Compute payload attitude ONCE for both trackers
         if roll is not None:
-            roll_rad = roll.to(u.rad).value
-            x_payload, y_payload = self._roll_attitude(tgt_unit, roll_rad)
-            if time.isscalar:
-                z_col = tgt_unit
-                degenerate = False
+            roll_rad = np.asarray(roll.to(u.rad).value, dtype=float)
+            if roll_rad.ndim == 0:
+                x_payload, y_payload = self._roll_attitude(
+                    tgt_unit, float(roll_rad)
+                )
+                if time.isscalar:
+                    z_col = tgt_unit
+                    degenerate = False
+                else:
+                    N = len(time)
+                    z_col = np.tile(tgt_unit.reshape(3, 1), (1, N))
+                    x_payload = x_payload[:, np.newaxis]  # (3,) → (3,1)
+                    y_payload = y_payload[:, np.newaxis]  # (3,) → (3,1)
+                    degenerate = np.zeros(N, dtype=bool)
             else:
+                # One roll per timestep, the shape get_visibility_best_roll
+                # returns. The attitude changes from step to step, so build
+                # every one of them in a single pass.
+                if time.isscalar or roll_rad.shape != time.shape:
+                    raise ValueError(
+                        "an array-valued roll needs one entry per timestep, "
+                        f"got shape {roll_rad.shape} for {time.shape} times"
+                    )
                 N = len(time)
                 z_col = np.tile(tgt_unit.reshape(3, 1), (1, N))
-                x_payload = x_payload[:, np.newaxis]  # (3,) → (3,1)
-                y_payload = y_payload[:, np.newaxis]  # (3,) → (3,1)
-                degenerate = np.zeros(N, dtype=bool)
+                # _roll_attitude_batch returns (N, 3); transpose so each
+                # column pairs with the timestep its roll came from.
+                x_all, y_all = self._roll_attitude_batch(tgt_unit, roll_rad)
+                x_payload, y_payload = x_all.T, y_all.T
+                # A NaN roll means no roll angle was found for that step, so
+                # the attitude is as undefined there as a degenerate
+                # Sun-constrained one.
+                degenerate = ~np.isfinite(roll_rad)
         elif time.isscalar:
             z_col = tgt_unit
             y_payload = np.cross(sun_vec, tgt_unit)
@@ -1125,10 +1243,7 @@ class Visibility:
 
             tracker_results.append(tracker_ok)
 
-        if self.st_required == 1:
-            combined = tracker_results[0] | tracker_results[1]
-        else:
-            combined = tracker_results[0] & tracker_results[1]
+        combined = self._combine_tracker_results(*tracker_results)
 
         if time.isscalar:
             return bool(combined)
@@ -1327,7 +1442,8 @@ class Visibility:
                 Orbit-optimal roll angle in degrees (NaN where not visible).
                 Constant within each orbit.
             n_st_pass : int or np.ndarray
-                Number of star trackers passing at the chosen roll (0-2).
+                Number of star trackers passing at the chosen roll, counting
+                only those with an active keep-out, so 0 to 2.
             solar_power_frac : float or np.ndarray
                 Solar panel power fraction at the chosen roll (NaN if not
                 visible).
@@ -1391,34 +1507,9 @@ class Visibility:
         if not self._st_constraint_active:
             pre = self._precompute(time)
             bu = pre["body_units"]
-            bs = (
-                self._fast_sep_deg(bu["moon"], tgt_b_all)
-                >= self.moon_min.to(u.deg).value
+            bs = self._boresight_ok(
+                tgt_b_all, bu, pre["zenith_unit"], pre["limb_angle_rad"]
             )
-            bs &= (
-                self._fast_sep_deg(bu["sun"], tgt_b_all)
-                >= self.sun_min.to(u.deg).value
-            )
-            bs &= (
-                self._fast_limb_deg(
-                    tgt_b_all, pre["zenith_unit"], pre["limb_angle_rad"]
-                )
-                >= self._effective_earthlimb_min_deg(
-                    tgt_b_all, pre["zenith_unit"], bu["sun"],
-                    limb_angle_rad=pre["limb_angle_rad"]
-                )
-            )
-            if self.mars_min > 0 * u.deg:
-                bs &= (
-                    self._fast_sep_deg(bu["mars"], tgt_b_all)
-                    >= self.mars_min.to(u.deg).value
-                )
-            if self.jupiter_min > 0 * u.deg:
-                bs &= (
-                    self._fast_sep_deg(bu["jupiter"], tgt_b_all)
-                    >= self.jupiter_min.to(u.deg).value
-                )
-            bs = np.asarray(bs).ravel()
             out_visible = bs.copy()
             out_boresight = bs.copy()
             if is_scalar:
@@ -1480,83 +1571,21 @@ class Visibility:
             limb_orb = pre_orbit_all["limb_angle_rad"][samples]
 
             # Boresight constraints on orbit
-            bs_orb = (
-                self._fast_sep_deg(bu_orb["moon"], tgt_b)
-                >= self.moon_min.to(u.deg).value
-            )
-            bs_orb &= (
-                self._fast_sep_deg(bu_orb["sun"], tgt_b)
-                >= self.sun_min.to(u.deg).value
-            )
-            bs_orb &= (
-                self._fast_limb_deg(tgt_b, zen_orb, limb_orb)
-                >= self._effective_earthlimb_min_deg(
-                    tgt_b, zen_orb, bu_orb["sun"],
-                    limb_angle_rad=limb_orb
-                )
-            )
-            if self.mars_min > 0 * u.deg:
-                bs_orb &= (
-                    self._fast_sep_deg(bu_orb["mars"], tgt_b)
-                    >= self.mars_min.to(u.deg).value
-                )
-            if self.jupiter_min > 0 * u.deg:
-                bs_orb &= (
-                    self._fast_sep_deg(bu_orb["jupiter"], tgt_b)
-                    >= self.jupiter_min.to(u.deg).value
-                )
-            bs_orb = np.asarray(bs_orb).ravel()
+            bs_orb = self._boresight_ok(tgt_b, bu_orb, zen_orb, limb_orb)
 
             best_orbit_roll = np.nan
 
+            # A roll is only worth searching for where the boresight is
+            # clear somewhere in the orbit. get_orbit_roll_angles drops that
+            # guard when a diagnostic needs an attitude regardless.
             if self._st_constraint_active and bs_orb.any():
-                # Roll sweep: every roll angle against every orbit sample
-                # in one pass, giving (N_roll, n_orbit_samp) arrays.
-                z_col_orb = np.tile(
-                    tgt_unit.reshape(3, 1), (1, n_orbit_samp)
+                st_ok_orb, solar_orb = self._orbit_roll_sweep(
+                    tgt_unit, roll_rads, bu_orb, zen_orb, limb_orb,
+                    n_orbit_samp,
                 )
-                x_pay_all, y_pay_all = self._roll_attitude_batch(
-                    tgt_unit, roll_rads
+                best_orbit_roll = self._pick_orbit_roll(
+                    roll_degs, st_ok_orb, solar_orb, bs_orb
                 )
-                st1_ok_orb = self._sweep_tracker(
-                    x_pay_all, y_pay_all, z_col_orb, st1_body, st1_checks,
-                    bu_orb, zen_orb, limb_orb,
-                )
-                st2_ok_orb = self._sweep_tracker(
-                    x_pay_all, y_pay_all, z_col_orb, st2_body, st2_checks,
-                    bu_orb, zen_orb, limb_orb,
-                )
-
-                # Solar power
-                cos_sy = np.clip(
-                    np.sum(y_pay_all[:, :, np.newaxis]
-                           * bu_orb["sun"][np.newaxis], axis=1),
-                    -1.0, 1.0,
-                )
-                theta_sy = np.arccos(np.abs(cos_sy))
-                solar_orb = np.cos(np.pi / 2 - theta_sy)
-
-                # Combined ST requirement
-                if self.st_required == 1:
-                    st_ok_combined = st1_ok_orb | st2_ok_orb
-                else:
-                    st_ok_combined = st1_ok_orb & st2_ok_orb
-
-                # Fully visible = boresight AND ST on orbit
-                vis_orb = bs_orb[np.newaxis, :] & st_ok_combined
-                vis_count = vis_orb.sum(axis=1)  # (N_roll,)
-                best_count = vis_count.max()
-                if best_count > 0:
-                    candidates = np.where(vis_count == best_count)[0]
-                    avg_power = np.array([
-                        solar_orb[r, vis_orb[r]].mean()
-                        for r in candidates
-                    ])
-                    best_orbit_roll = roll_degs[
-                        candidates[np.argmax(avg_power)]
-                    ]
-                    # Normalize to [-180, 180]
-                    best_orbit_roll = (best_orbit_roll + 180) % 360 - 180
 
             # ── Evaluate at input times with orbit-optimal roll ───
             bu_inp = {name: unit[:, idx]
@@ -1566,32 +1595,9 @@ class Visibility:
             N_chunk = len(idx)
 
             # Boresight at input times (per-timestep target direction)
-            bs_inp = (
-                self._fast_sep_deg(bu_inp["moon"], chunk_tgt_b)
-                >= self.moon_min.to(u.deg).value
+            bs_inp = self._boresight_ok(
+                chunk_tgt_b, bu_inp, zen_inp, limb_inp
             )
-            bs_inp &= (
-                self._fast_sep_deg(bu_inp["sun"], chunk_tgt_b)
-                >= self.sun_min.to(u.deg).value
-            )
-            bs_inp &= (
-                self._fast_limb_deg(chunk_tgt_b, zen_inp, limb_inp)
-                >= self._effective_earthlimb_min_deg(
-                    chunk_tgt_b, zen_inp, bu_inp["sun"],
-                    limb_angle_rad=limb_inp
-                )
-            )
-            if self.mars_min > 0 * u.deg:
-                bs_inp &= (
-                    self._fast_sep_deg(bu_inp["mars"], chunk_tgt_b)
-                    >= self.mars_min.to(u.deg).value
-                )
-            if self.jupiter_min > 0 * u.deg:
-                bs_inp &= (
-                    self._fast_sep_deg(bu_inp["jupiter"], chunk_tgt_b)
-                    >= self.jupiter_min.to(u.deg).value
-                )
-            bs_inp = np.asarray(bs_inp).ravel()
             out_boresight[idx] = bs_inp
 
             if np.isnan(best_orbit_roll):
@@ -1647,16 +1653,17 @@ class Visibility:
                     continue
                 t2_ok &= sep >= lim
 
-            if self.st_required == 1:
-                st_ok_inp = t1_ok | t2_ok
-            else:
-                st_ok_inp = t1_ok & t2_ok
+            st_ok_inp = self._combine_tracker_results(t1_ok, t2_ok)
 
             vis_inp = bs_inp & st_ok_inp
             out_visible[idx] = vis_inp
-            out_nst[idx] = np.where(
-                vis_inp, t1_ok.astype(int) + t2_ok.astype(int), 0
+            # Count only the trackers something was asked of, to match the
+            # rule _combine_tracker_results applies just above.
+            passing = sum(
+                (t1_ok if tracker == 1 else t2_ok).astype(int)
+                for tracker in self._trackers_with_checks()
             )
+            out_nst[idx] = np.where(vis_inp, passing, 0)
 
             # Solar power at input times
             cos_sy = np.sum(y_pay[:, np.newaxis] * bu_inp["sun"], axis=0)
@@ -1683,38 +1690,133 @@ class Visibility:
             "solar_power_frac": out_power,
         }
 
-    @staticmethod
-    def _get_angle_from_earth_limb(
-        observer_location: EarthLocation, target_coord: SkyCoord, obstime: Time
-    ) -> u.Quantity:
-        """
-        Calculate the angular distance from the Earth's limb to the target.
+    def get_orbit_roll_angles(self, target_coord: SkyCoord, time: Time,
+                              roll_step=2 * u.deg,
+                              orbit_time_step=1 * u.min):
+        """Roll angle held during each orbit, one value per timestep.
 
-        Parameters:
-        observer_location : EarthLocation
-            The observer's location on the Earth.
+        The same choice ``get_visibility_best_roll`` makes, with one
+        difference: an orbit whose boresight is blocked the whole way round
+        still gets a roll here. That method skips the sweep for a roll it
+        could never use, which is the cheaper thing to do when all it owes
+        the caller is a visibility flag. A diagnostic needs more, because
+        without an attitude there is no way to say which star tracker would
+        have failed on an orbit the boresight had already lost. This sweeps
+        either way.
+
+        Wherever a roll could serve the target this returns exactly the
+        angle ``get_visibility_best_roll`` used, so feeding the result to
+        ``get_all_constraints`` or ``get_star_tracker_breakdown`` explains
+        that run step for step.
+
+        Assumes the target direction is fixed across an orbit, as
+        ``get_visibility_best_roll`` does: aberration moves it by well
+        under an arcsecond over one period.
+
+        Parameters
+        ----------
         target_coord : SkyCoord
-            The target coordinate to compute the angle for.
-        obstime : Time
-            The observation time.
+            The science target coordinate (+Z boresight direction).
+        time : Time
+            Observation time(s), scalar or array.
+        roll_step : Quantity, optional
+            Roll sweep resolution (default 2 deg). Give the same value used
+            for ``get_visibility_best_roll``, or the two searches can land
+            on different angles.
+        orbit_time_step : Quantity, optional
+            Sampling interval within each orbit window (default 1 min).
+            Match it for the same reason.
 
-        Returns:
-        u.Quantity
-            The angular distance in degrees.
+        Returns
+        -------
+        float or np.ndarray
+            Roll in degrees in [-180, 180], constant within each orbit. NaN
+            only when the star tracker keep-outs are switched off, since no
+            roll is chosen at all then.
+
+        Examples
+        --------
+        >>> roll = vis.get_orbit_roll_angles(target, times)
+        >>> constraints = vis.get_all_constraints(target, times,
+        ...                                       roll=roll * u.deg)
         """
-        # Convert target coordinate to the AltAz frame
-        altaz = target_coord.transform_to(
-            AltAz(location=observer_location, obstime=obstime)
-        )
-        alt = altaz.alt
+        _validate_angle(roll_step, "roll_step")
+        _validate_time_quantity(orbit_time_step, "orbit_time_step")
+        if not roll_step.isscalar:
+            raise ValueError("roll_step must be a scalar Quantity")
+        if not orbit_time_step.isscalar:
+            raise ValueError("orbit_time_step must be a scalar Quantity")
 
-        # Calculate the angular radius of the Earth's limb
-        x, y, z = observer_location.geocentric
-        observer_distance = np.sqrt(np.square(x) + np.square(y) + np.square(z))
-        with np.errstate(invalid="ignore"):
-            limb_angle = np.arccos(R_earth / observer_distance)
+        is_scalar = time.isscalar
+        if is_scalar:
+            time = Time([time])
 
-        return alt + limb_angle
+        out_roll = np.full(len(time), np.nan)
+        if not self._st_constraint_active:
+            # No tracker keep-outs, so nothing selects a roll.
+            return float(out_roll[0]) if is_scalar else out_roll
+
+        roll_degs = np.arange(0, 360, roll_step.to(u.deg).value)
+        roll_rads = np.deg2rad(roll_degs)
+
+        # Shares the orbit grouping and its ephemeris with
+        # get_visibility_best_roll, so calling both on one time grid pays
+        # for the expensive part once.
+        grid = self._orbit_sampling_grid(time, orbit_time_step)
+        n_orbit_samp = grid["n_orbit_samp"]
+        pre_orbit_all = grid["pre_orbit_all"]
+
+        center_xyz = target_coord.transform_to(
+            GCRS(obstime=grid["centers"])
+        ).cartesian.xyz.value
+        center_units = center_xyz / np.linalg.norm(
+            center_xyz, axis=0, keepdims=True
+        )  # (3, n_orbits)
+
+        all_samples = np.ones(n_orbit_samp, dtype=bool)
+
+        for position, idx in enumerate(grid["chunk_indices"]):
+            target_unit = center_units[:, position]
+            samples = slice(position * n_orbit_samp,
+                            (position + 1) * n_orbit_samp)
+            body_units = {name: unit[:, samples]
+                          for name, unit in pre_orbit_all["body_units"].items()}
+            zenith_unit = pre_orbit_all["zenith_unit"][:, samples]
+            limb_angle_rad = pre_orbit_all["limb_angle_rad"][samples]
+
+            st_ok, solar = self._orbit_roll_sweep(
+                target_unit, roll_rads, body_units, zenith_unit,
+                limb_angle_rad, n_orbit_samp,
+            )
+
+            # Ask the question get_visibility_best_roll asks first, so the
+            # two agree on every orbit where it found an answer.
+            boresight_ok = self._boresight_ok(
+                target_unit[:, np.newaxis], body_units, zenith_unit,
+                limb_angle_rad,
+            )
+            roll = self._pick_orbit_roll(roll_degs, st_ok, solar,
+                                         boresight_ok)
+
+            if np.isnan(roll):
+                # Nothing was observable this orbit. Rank the rolls on the
+                # trackers alone: they do not care why the boresight was
+                # lost, and the diagnostic still has to name the tracker
+                # that would have failed.
+                roll = self._pick_orbit_roll(roll_degs, st_ok, solar,
+                                             all_samples)
+
+            if np.isnan(roll):
+                # No roll passes a tracker anywhere in the orbit, so there
+                # is no tie for solar power to break. Keep the arrays best
+                # lit instead, which at least leaves the attitude defined
+                # and physically sensible.
+                best = roll_degs[np.argmax(solar.mean(axis=1))]
+                roll = float((best + 180) % 360 - 180)
+
+            out_roll[idx] = roll
+
+        return float(out_roll[0]) if is_scalar else out_roll
 
     @property
     def _st_constraint_active(self) -> bool:
@@ -1728,6 +1830,48 @@ class Visibility:
             if self._st_earthlimb_min_for(t) > 0 * u.deg:
                 return True
         return False
+
+    def _trackers_with_checks(self) -> list:
+        """Tracker numbers carrying at least one active keep-out.
+
+        A tracker with an empty check list is not modelled at all rather
+        than modelled as unconstrained, which is what keeps it out of the
+        ``st_required`` count in ``_combine_tracker_results``.
+        """
+        return [tracker for tracker in (1, 2)
+                if self._st_checks_for(tracker)]
+
+    def _combine_tracker_results(self, st1_ok, st2_ok):
+        """Reduce the two tracker verdicts to the ``st_required`` answer.
+
+        The one place ``st_required`` is applied, so the constraint check,
+        the breakdown and both roll searches cannot disagree about what it
+        means.
+
+        A tracker with no active keep-out is left out of the count instead
+        of counting as a pass. Otherwise "at least one tracker" would be
+        satisfied by a tracker nothing was ever asked of, and a per-tracker
+        limit set on its own, ``st1_earthlimb_min`` with nothing for ST2,
+        would silently reject nothing. With ``st_required=2`` this changes
+        no result, since ANDing against an always-passing tracker already
+        reduced to the constrained one.
+
+        Parameters
+        ----------
+        st1_ok, st2_ok : bool or np.ndarray of bool
+            Whether each tracker met all of its own active keep-outs.
+
+        Returns
+        -------
+        bool or np.ndarray of bool
+            Whether the star tracker requirement is met.
+        """
+        active = self._trackers_with_checks()
+        if len(active) == 1:
+            return st1_ok if active[0] == 1 else st2_ok
+        if self.st_required == 1:
+            return st1_ok | st2_ok
+        return st1_ok & st2_ok
 
     def _st_earthlimb_min_for(self, tracker: int):
         """Effective Earth limb keep-out for a specific tracker.
@@ -1859,6 +2003,148 @@ class Visibility:
         sin_r = np.sin(roll_rads)[:, np.newaxis]
         return (cos_r * x_ref + sin_r * y_ref, -sin_r * x_ref + cos_r * y_ref)
 
+    def _boresight_ok(self, target_b, body_units, zenith_unit,
+                      limb_angle_rad):
+        """Boresight keep-out verdict over a set of samples.
+
+        Where the boresight visibility is checked during a roll
+        search, so ``get_visibility_best_roll`` and
+        ``get_orbit_roll_angles`` can never disagree about which samples a
+        roll could be used at.
+
+        Parameters
+        ----------
+        target_b : np.ndarray
+            Target direction, (3, 1) to broadcast one direction over every
+            sample, or (3, N) for a direction per sample.
+        body_units : dict
+            Body direction unit vectors from ``_precompute``.
+        zenith_unit : np.ndarray
+            Observer zenith directions, (3, N).
+        limb_angle_rad : float or np.ndarray
+            Earth limb half-angle in radians for those samples.
+
+        Returns
+        -------
+        np.ndarray
+            (N,) boolean, True where every active boresight keep-out passes.
+        """
+        ### BORESIGHT-MOON KEEPOUT
+        ok = (
+            self._fast_sep_deg(body_units["moon"], target_b)
+            >= self.moon_min.to(u.deg).value
+        )
+
+        ### BORESIGHT-SUN KEEPOUT
+        ok &= (
+            self._fast_sep_deg(body_units["sun"], target_b)
+            >= self.sun_min.to(u.deg).value
+        )
+
+        ### BORESIGHT-EARTHLIMB KEEPOUT
+        ok &= (
+            self._fast_limb_deg(target_b, zenith_unit, limb_angle_rad)
+            >= self._effective_earthlimb_min_deg(
+                target_b, zenith_unit, body_units["sun"],
+                limb_angle_rad=limb_angle_rad,
+            )
+        )
+
+        ### BORESIGHT-MARS KEEPOUT
+        if self.mars_min > 0 * u.deg:
+            ok &= (
+                self._fast_sep_deg(body_units["mars"], target_b)
+                >= self.mars_min.to(u.deg).value
+            )
+
+        ### BORESIGHT-JUPITER KEEPOUT
+        if self.jupiter_min > 0 * u.deg:
+            ok &= (
+                self._fast_sep_deg(body_units["jupiter"], target_b)
+                >= self.jupiter_min.to(u.deg).value
+            )
+        return np.asarray(ok).ravel()
+
+    def _orbit_roll_sweep(self, target_unit, roll_rads, body_units,
+                          zenith_unit, limb_angle_rad, n_samples):
+        """Star tracker verdict and solar power for every roll over one orbit.
+
+        Parameters
+        ----------
+        target_unit : np.ndarray
+            (3,) boresight direction, held fixed across the orbit.
+        roll_rads : np.ndarray
+            (n_rolls,) roll angles to try, in radians.
+        body_units, zenith_unit, limb_angle_rad
+            Precomputed quantities for this orbit's samples.
+        n_samples : int
+            Number of samples in the orbit window.
+
+        Returns
+        -------
+        st_ok : np.ndarray
+            (n_rolls, n_samples) boolean, True where the ``st_required``
+            combination of trackers passes.
+        solar : np.ndarray
+            (n_rolls, n_samples) solar array power fraction.
+        """
+        z_col = np.tile(target_unit.reshape(3, 1), (1, n_samples))
+        x_payload, y_payload = self._roll_attitude_batch(
+            target_unit, roll_rads
+        )
+
+        tracker_ok = [
+            self._sweep_tracker(
+                x_payload, y_payload, z_col,
+                np.array(self._get_star_tracker_body_xyz(tracker)),
+                self._st_checks_for(tracker),
+                body_units, zenith_unit, limb_angle_rad,
+            )
+            for tracker in (1, 2)
+        ]
+        st_ok = self._combine_tracker_results(*tracker_ok)
+
+        cos_sy = np.clip(
+            np.sum(
+                y_payload[:, :, np.newaxis] * body_units["sun"][np.newaxis],
+                axis=1,
+            ),
+            -1.0, 1.0,
+        )
+        solar = np.cos(np.pi / 2 - np.arccos(np.abs(cos_sy)))
+        return st_ok, solar
+
+    @staticmethod
+    def _pick_orbit_roll(roll_degs, st_ok, solar, usable):
+        """Roll with the most usable samples, average solar power breaking ties.
+
+        Parameters
+        ----------
+        roll_degs : np.ndarray
+            (n_rolls,) candidate roll angles in degrees.
+        st_ok, solar : np.ndarray
+            (n_rolls, n_samples) arrays from ``_orbit_roll_sweep``.
+        usable : np.ndarray
+            (n_samples,) boolean marking samples a roll could be used at.
+            Pass the boresight verdict to pick the roll that observes the
+            most, or all True to ask which roll suits the star trackers
+            alone, ignoring whether the boresight was clear.
+
+        Returns
+        -------
+        float
+            Roll in degrees normalized to [-180, 180], or NaN when no roll
+            has a single usable sample.
+        """
+        good = usable[np.newaxis, :] & st_ok
+        counts = good.sum(axis=1)
+        if counts.max() == 0:
+            return np.nan
+        candidates = np.where(counts == counts.max())[0]
+        avg_power = np.array([solar[r, good[r]].mean() for r in candidates])
+        best = roll_degs[candidates[np.argmax(avg_power)]]
+        return float((best + 180) % 360 - 180)
+
     def _sweep_tracker(self, x_payload, y_payload, z_col, st_body, checks,
                        body_units, zenith_unit, limb_rad):
         """Star tracker keep-out check for every roll angle at once.
@@ -1969,10 +2255,21 @@ class Visibility:
         )
         earth_angle = st_coord.separation(earth_coord)
 
-        # Earth limb angle
-        earthlimb_angle = self._get_angle_from_earth_limb(
-            observer_location, st_coord, time
-        )
+        # Earth limb angle, geocentric like the constraint check, so this
+        # reports the number get_star_tracker_constraint applies rather
+        # than one that merely resembles it. An AltAz altitude is measured
+        # from the geodetic horizon, which sits up to ~0.2 deg away from
+        # the geocentric one, enough to disagree about a tracker sitting
+        # near its limit.
+        pre = self._precompute(time)
+        st_xyz = st_coord.cartesian.xyz.value
+        if time.isscalar:
+            st_unit = st_xyz / np.linalg.norm(st_xyz)
+        else:
+            st_unit = st_xyz / np.linalg.norm(st_xyz, axis=0, keepdims=True)
+        earthlimb_angle = self._fast_limb_deg(
+            st_unit, pre["zenith_unit"], pre["limb_angle_rad"]
+        ) * u.deg
 
         return {
             "ra": st_coord.spherical.lon.to(u.deg),
@@ -2136,7 +2433,7 @@ class Visibility:
             )
 
     def get_star_tracker_constraint(self, target_coord: SkyCoord, time: Time,
-                                    pre: dict = None):
+                                    pre: dict = None, roll=None):
         """
         Check if the required number of star trackers satisfy all keep-out constraints.
 
@@ -2152,6 +2449,12 @@ class Visibility:
             The observation time (scalar or array)
         pre : dict, optional
             Precomputed time-dependent data from ``_precompute``.
+        roll : Quantity, optional
+            Roll angle about the boresight for this call only. Scalar, or
+            one angle per timestep to reproduce a run whose attitude
+            changed, as ``get_orbit_roll_angles`` returns. ``None`` keeps
+            the instance value, which itself defaults to the
+            Sun-constrained attitude.
 
         Returns:
         --------
@@ -2169,13 +2472,21 @@ class Visibility:
                 return True
             return np.ones(time.shape, dtype=bool)
 
+        if roll is not None:
+            _validate_angle(roll, "roll")
+            effective_roll = roll.to(u.deg)
+        else:
+            effective_roll = self.roll
+
         if pre is None:
             pre = self._precompute(time)
         target_unit = self._target_unit(target_coord, time)
         if not time.isscalar:
             target_unit = target_unit[:, 0].copy()
 
-        return self._get_st_constraint_fast(target_unit, time, pre)
+        return self._get_st_constraint_fast(
+            target_unit, time, pre, effective_roll=effective_roll
+        )
 
     def get_star_tracker_breakdown(self, target_coord: SkyCoord, time: Time,
                                    roll=None, pre: dict = None) -> dict:
@@ -2275,10 +2586,10 @@ class Visibility:
             )
         elif time.isscalar and degenerate:
             passed["combined"] = False
-        elif self.st_required == 1:
-            passed["combined"] = tracker_overall[1] | tracker_overall[2]
         else:
-            passed["combined"] = tracker_overall[1] & tracker_overall[2]
+            passed["combined"] = self._combine_tracker_results(
+                tracker_overall[1], tracker_overall[2]
+            )
 
         return {
             "passed": passed,
@@ -2286,12 +2597,32 @@ class Visibility:
             "limits": limits_out,
         }
 
-    def get_all_constraints(self, target_coord: SkyCoord, time: Time) -> dict:
+    def get_all_constraints(self, target_coord: SkyCoord, time: Time,
+                            roll=None) -> dict:
         """Get status of all active constraints.
 
         Every constraint is evaluated from a single set of precomputed
         ephemeris and orbit data, so the results agree with
         ``get_visibility`` body for body.
+
+        Parameters
+        ----------
+        target_coord : SkyCoord
+            The target coordinate to check.
+        time : Time
+            Observation time(s), scalar or array.
+        roll : Quantity, optional
+            Roll angle about the boresight for this call only, forwarded to
+            the star tracker check. Only the star tracker constraint
+            depends on it; the boresight ones do not.  Pass the array
+            from ``get_orbit_roll_angles`` to explain a
+            ``get_visibility_best_roll`` run, since the default
+            Sun-constrained attitude is not the one that run held.
+
+        Returns
+        -------
+        dict
+            One boolean or boolean array per active constraint.
         """
         pre = self._precompute(time)
         constraints = {
@@ -2314,7 +2645,7 @@ class Visibility:
 
         if self._st_constraint_active:
             constraints["star_tracker"] = self.get_star_tracker_constraint(
-                target_coord, time, pre=pre
+                target_coord, time, pre=pre, roll=roll
             )
 
         return constraints
@@ -2412,7 +2743,11 @@ class Visibility:
                 la_rad = pre["limb_angle_rad"]
                 tgt_u = self._target_unit(target_coord, time)
                 if self.use_dynamic_earthlimb:
-                    illum = float(self._get_earth_illumination_angle(
+                    # Must go through _daynight_illumination_angle, not
+                    # _get_earth_illumination_angle directly, so the
+                    # reported angle is measured at the same point
+                    # _effective_earthlimb_min_deg used.
+                    illum = float(self._daynight_illumination_angle(
                         tgt_u, zenith_u, sun_u, limb_angle_rad=la_rad,
                     ))
                     side = f"illum {illum:.1f}°"
@@ -2448,28 +2783,35 @@ class Visibility:
                 f"Star Tracker Constraints (need {req_label} tracker passing):"
             )
 
-            for tracker in [1, 2]:
-                try:
-                    angles = self.get_star_tracker_angles(target_coord, time, tracker)
-                    tracker_pass = True
-                    details = []
-                    for name, limit, key in self._st_checks_for(tracker):
-                        actual = angles[key]
-                        ok = bool(actual >= limit)
-                        tracker_pass = tracker_pass and ok
-                        sym = "✓" if ok else "✗"
-                        details.append(
-                            f"{name}:{sym} req:{limit:>6.1f} act:{actual:>6.1f}"
-                        )
-                    symbol = "✓" if tracker_pass else "✗"
-                    status = "PASS" if tracker_pass else "FAIL"
-                    lines.append(f"  ST{tracker:<8}{symbol} {status}")
-                    for d in details:
-                        lines.append(f"    {d}")
-                except ValueError as e:
-                    lines.append(f"  ST{tracker:<8}✗ ERROR ({e})")
+            # Rows and result both come from the breakdown, which shares
+            # its geometry with the constraint check itself. Deriving the
+            # rows from get_star_tracker_angles let them contradict the
+            # result printed underneath, because that reported an AltAz
+            # limb angle while the check applied a geocentric one.
+            breakdown = self.get_star_tracker_breakdown(target_coord, time)
 
-            st_combined = self.get_star_tracker_constraint(target_coord, time)
+            for tracker in [1, 2]:
+                tracker_pass = breakdown["passed"][f"ST{tracker}"]
+                symbol = "✓" if tracker_pass else "✗"
+                status = "PASS" if tracker_pass else "FAIL"
+                lines.append(f"  ST{tracker:<8}{symbol} {status}")
+
+                for name, limit, _ in self._st_checks_for(tracker):
+                    row = f"ST{tracker} {name}"
+                    sym = "✓" if breakdown["passed"][row] else "✗"
+                    actual = breakdown["separations"][row]
+                    # NaN means the attitude itself is undefined, which
+                    # happens when the target lies along the Sun and
+                    # Sun x Z stops defining a payload +Y.
+                    shown = (
+                        "  undefined" if np.isnan(actual)
+                        else f"{actual * u.deg:>6.1f}"
+                    )
+                    lines.append(
+                        f"    {name}:{sym} req:{limit:>6.1f} act:{shown}"
+                    )
+
+            st_combined = breakdown["passed"]["combined"]
             st_sym = "✓" if st_combined else "✗"
             st_stat = "PASS" if st_combined else "FAIL"
             lines.append(f"  {'Result':<9}{st_sym} {st_stat}")
