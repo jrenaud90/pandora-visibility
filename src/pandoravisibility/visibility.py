@@ -1402,6 +1402,103 @@ class Visibility:
         self._orbit_grid_cache_value = grid
         return grid
 
+    def get_best_roll(self, target_coord: SkyCoord, time: Time,
+                      roll_step=2 * u.deg, min_power_frac=None,
+                      weights=None) -> dict:
+        """Best single roll held over every timestep in ``time``.
+
+        Sweeps ``roll_step``-spaced rolls and keeps the one that observes
+        the most timesteps, meaning the boresight keep-outs pass and the
+        star trackers pass at that roll; ties go to the highest mean solar
+        power. ``get_visibility_best_roll`` makes the same choice once per
+        orbit; this holds one roll across everything it is given, which is
+        what an observation that must not change attitude needs.
+
+        When no roll observes a single timestep, or the star tracker
+        keep-outs are switched off, the roll best for the trackers alone
+        and then the roll with the highest mean solar power are returned in
+        turn, so the caller always has an attitude; ``n_visible`` says
+        whether it observes anything.
+
+        Assumes the target direction is fixed across ``time`` for the star
+        trackers: aberration moves it by well under an arcsecond over a day.
+
+        Parameters
+        ----------
+        target_coord : SkyCoord
+            The science target coordinate (+Z boresight direction).
+        time : Time
+            Observation time(s), scalar or array.
+        roll_step : Quantity, optional
+            Roll sweep resolution (default 2 deg).
+        min_power_frac : float, optional
+            Rolls whose mean solar power over ``time`` falls below this are
+            not considered. None (default) applies no floor. A floor no roll
+            reaches is ignored rather than leaving the attitude undefined.
+        weights : array-like, optional
+            Weight of each timestep in the count, default 1 everywhere.
+            Integer weights keep the count exact, so giving one group of
+            timesteps a weight larger than the other group's total ranks
+            it strictly first and leaves the other to break ties.
+
+        Returns
+        -------
+        dict
+            roll_deg : float
+                Chosen roll in degrees, in [-180, 180].
+            n_visible : int
+                Timesteps visible at that roll.
+            visible : bool or np.ndarray
+                True where boresight and star tracker keep-outs pass at
+                that roll.
+            boresight_visible : bool or np.ndarray
+                True where the boresight keep-outs alone pass.
+            n_st_pass : int or np.ndarray
+                Star trackers passing where visible, counting only those
+                with an active keep-out, else 0.
+            solar_power_frac : float or np.ndarray
+                Solar array power fraction at that roll, NaN where not
+                visible.
+
+        Examples
+        --------
+        >>> times = Time("2026-02-15T18:00:00") + np.arange(300) * u.min
+        >>> result = vis.get_best_roll(target, times, min_power_frac=0.7)
+        >>> print(result["roll_deg"], result["n_visible"])
+        """
+        _validate_angle(roll_step, "roll_step")
+        if not roll_step.isscalar:
+            raise ValueError("roll_step must be a scalar Quantity")
+        if min_power_frac is not None and not 0 <= min_power_frac <= 1:
+            raise ValueError("min_power_frac must be between 0 and 1")
+
+        is_scalar = time.isscalar
+        if is_scalar:
+            time = Time([time])
+        if weights is not None:
+            weights = np.asarray(weights)
+            if weights.shape != (len(time),):
+                raise ValueError("weights must have one entry per timestep")
+
+        pre = self._precompute(time)
+        target_xyz = target_coord.transform_to(
+            GCRS(obstime=time)
+        ).cartesian.xyz.value
+        target_b = target_xyz / np.linalg.norm(
+            target_xyz, axis=0, keepdims=True
+        )  # (3, N)
+        result = self._best_roll(
+            target_b[:, 0].copy(), pre,
+            np.arange(0, 360, roll_step.to(u.deg).value),
+            target_b=target_b, min_power_frac=min_power_frac,
+            weights=weights,
+        )
+        if is_scalar:
+            for key in ("visible", "boresight_visible", "n_st_pass",
+                        "solar_power_frac"):
+                result[key] = result[key][0].item()
+        return result
+
     def get_visibility_best_roll(
         self, target_coord: SkyCoord, time: Time, roll_step=2 * u.deg,
         orbit_time_step=1 * u.min,
@@ -1416,7 +1513,9 @@ class Visibility:
 
         The best roll is the one satisfying all star-tracker keep-out
         constraints at the greatest number of boresight-visible orbit
-        timesteps, with solar array power as tiebreaker.
+        timesteps, with solar array power as tiebreaker. It is the choice
+        ``get_best_roll`` makes, made once per orbit window; call that
+        directly to hold one roll over an arbitrary set of times.
 
         Parameters
         ----------
@@ -1487,14 +1586,7 @@ class Visibility:
             tgt_xyz, axis=0, keepdims=True
         )  # (3, N_input)
 
-        # Roll setup
-        step_deg = roll_step.to(u.deg).value
-        roll_degs = np.arange(0, 360, step_deg)
-
-        st1_body = np.array(self._get_star_tracker_body_xyz(1))
-        st2_body = np.array(self._get_star_tracker_body_xyz(2))
-        st1_checks = self._st_checks_for(1)
-        st2_checks = self._st_checks_for(2)
+        roll_degs = np.arange(0, 360, roll_step.to(u.deg).value)
 
         # Output arrays
         out_visible = np.zeros(N_input, dtype=bool)
@@ -1503,176 +1595,67 @@ class Visibility:
         out_nst = np.zeros(N_input, dtype=int)
         out_power = np.full(N_input, np.nan)
 
-        # ── Fast path: no ST constraints ───────────────────────────
         if not self._st_constraint_active:
+            # Nothing selects a roll: the boresight keep-outs do not depend
+            # on one, so the answer is the boresight verdict alone.
             pre = self._precompute(time)
-            bu = pre["body_units"]
-            bs = self._boresight_ok(
-                tgt_b_all, bu, pre["zenith_unit"], pre["limb_angle_rad"]
+            out_boresight = self._boresight_ok(
+                tgt_b_all, pre["body_units"], pre["zenith_unit"],
+                pre["limb_angle_rad"],
             )
-            out_visible = bs.copy()
-            out_boresight = bs.copy()
-            if is_scalar:
-                return {
-                    "visible": bool(out_visible[0]),
-                    "boresight_visible": bool(out_boresight[0]),
-                    "roll_deg": float(out_roll[0]),
-                    "n_st_pass": int(out_nst[0]),
-                    "solar_power_frac": float(out_power[0]),
-                }
-            return {
-                "visible": out_visible,
-                "boresight_visible": out_boresight,
-                "roll_deg": out_roll,
-                "n_st_pass": out_nst,
-                "solar_power_frac": out_power,
-            }
+            out_visible = out_boresight.copy()
+        else:
+            # Orbit grouping and orbit sampling. Target-independent, so it
+            # is built once per time grid and reused by every target
+            # evaluated against the same grid.
+            grid = self._orbit_sampling_grid(time, orbit_time_step)
+            n_orbit_samp = grid["n_orbit_samp"]
 
-        # Orbit grouping and orbit sampling
-        # This is all target-independent, so it is built once per time grid
-        # and reused by every target evaluated against the same grid.
-        grid = self._orbit_sampling_grid(time, orbit_time_step)
-        orbit_ids = grid["orbit_ids"]
-        chunk_indices = grid["chunk_indices"]
-        centers = grid["centers"]
-        n_orbit_samp = grid["n_orbit_samp"]
-        pre_orbit_all = grid["pre_orbit_all"]
-        pre_input_all = grid["pre_input_all"]
+            # One target direction per orbit, at its centre, in one
+            # vectorised transform rather than one per orbit. Aberration
+            # shift within one orbit (~97 min) is <0.1", so it serves the
+            # roll sweep and the orbit-sample boresight checks alike.
+            center_xyz = target_coord.transform_to(
+                GCRS(obstime=grid["centers"])
+            ).cartesian.xyz.value
+            center_units = center_xyz / np.linalg.norm(
+                center_xyz, axis=0, keepdims=True
+            )  # (3, n_orbits)
 
-        # Per-orbit representative target direction at each orbit center,
-        # in one vectorised transform rather than one per orbit.
-        # Aberration shift within one orbit (~97 min) is <0.1", so a single
-        # direction is fine for the roll sweep and orbit-sample boresight
-        # constraints.
-        center_xyz = target_coord.transform_to(
-            GCRS(obstime=centers)
-        ).cartesian.xyz.value
-        center_units = center_xyz / np.linalg.norm(
-            center_xyz, axis=0, keepdims=True
-        )  # (3, n_orbits)
+            for position, idx in enumerate(grid["chunk_indices"]):
+                tgt_unit = center_units[:, position]
 
-        roll_rads = np.deg2rad(roll_degs)
-
-        for position, oid in enumerate(orbit_ids):
-            idx = chunk_indices[position]
-
-            tgt_unit = center_units[:, position]
-            tgt_b = tgt_unit[:, np.newaxis]  # (3, 1) for orbit sampling
-
-            # Per-timestep target directions for input boresight checks
-            chunk_tgt_b = tgt_b_all[:, idx]  # (3, N_chunk)
-
-            # ── Find best roll from orbit window ──────────────────
-            samples = slice(position * n_orbit_samp,
-                            (position + 1) * n_orbit_samp)
-            bu_orb = {name: unit[:, samples]
-                      for name, unit in pre_orbit_all["body_units"].items()}
-            zen_orb = pre_orbit_all["zenith_unit"][:, samples]
-            limb_orb = pre_orbit_all["limb_angle_rad"][samples]
-
-            # Boresight constraints on orbit
-            bs_orb = self._boresight_ok(tgt_b, bu_orb, zen_orb, limb_orb)
-
-            best_orbit_roll = np.nan
-
-            # A roll is only worth searching for where the boresight is
-            # clear somewhere in the orbit. get_orbit_roll_angles drops that
-            # guard when a diagnostic needs an attitude regardless.
-            if self._st_constraint_active and bs_orb.any():
-                st_ok_orb, solar_orb = self._orbit_roll_sweep(
-                    tgt_unit, roll_rads, bu_orb, zen_orb, limb_orb,
-                    n_orbit_samp,
+                # The roll is chosen over the full orbit window rather than
+                # the input times, so an orbit holding one input minute is
+                # treated the same as one holding ninety.
+                window = slice(position * n_orbit_samp,
+                               (position + 1) * n_orbit_samp)
+                chosen = self._best_roll(
+                    tgt_unit,
+                    self._slice_precompute(grid["pre_orbit_all"], window),
+                    roll_degs,
                 )
-                best_orbit_roll = self._pick_orbit_roll(
-                    roll_degs, st_ok_orb, solar_orb, bs_orb
+                # Then held at the input times, which carry their own
+                # per-timestep boresight directions.
+                at_input = self._best_roll(
+                    tgt_unit,
+                    self._slice_precompute(grid["pre_input_all"], idx),
+                    np.array([chosen["roll_deg"]]),
+                    target_b=tgt_b_all[:, idx],
                 )
+                out_boresight[idx] = at_input["boresight_visible"]
 
-            # ── Evaluate at input times with orbit-optimal roll ───
-            bu_inp = {name: unit[:, idx]
-                      for name, unit in pre_input_all["body_units"].items()}
-            zen_inp = pre_input_all["zenith_unit"][:, idx]
-            limb_inp = pre_input_all["limb_angle_rad"][idx]
-            N_chunk = len(idx)
-
-            # Boresight at input times (per-timestep target direction)
-            bs_inp = self._boresight_ok(
-                chunk_tgt_b, bu_inp, zen_inp, limb_inp
-            )
-            out_boresight[idx] = bs_inp
-
-            if np.isnan(best_orbit_roll):
-                # No roll satisfied ST constraints for this orbit;
-                # out_visible remains False, out_roll stays NaN.
-                continue
-
-            # ST constraints at input times with the orbit-optimal roll
-            roll_rad = np.deg2rad(best_orbit_roll)
-            x_pay, y_pay = self._roll_attitude(tgt_unit, roll_rad)
-            z_col_inp = np.tile(tgt_unit.reshape(3, 1), (1, N_chunk))
-
-            st1_eci = (
-                x_pay[:, np.newaxis] * st1_body[0]
-                + y_pay[:, np.newaxis] * st1_body[1]
-                + z_col_inp * st1_body[2]
-            )
-            st1_eci = st1_eci / np.linalg.norm(
-                st1_eci, axis=0, keepdims=True
-            )
-            st2_eci = (
-                x_pay[:, np.newaxis] * st2_body[0]
-                + y_pay[:, np.newaxis] * st2_body[1]
-                + z_col_inp * st2_body[2]
-            )
-            st2_eci = st2_eci / np.linalg.norm(
-                st2_eci, axis=0, keepdims=True
-            )
-
-            t1_ok = np.ones(N_chunk, dtype=bool)
-            for _, limit, key in st1_checks:
-                lim = limit.to(u.deg).value
-                if key == "sun_angle":
-                    sep = self._fast_sep_deg(st1_eci, bu_inp["sun"])
-                elif key == "moon_angle":
-                    sep = self._fast_sep_deg(st1_eci, bu_inp["moon"])
-                elif key == "earthlimb_angle":
-                    sep = self._fast_limb_deg(st1_eci, zen_inp, limb_inp)
-                else:
+                if chosen["n_visible"] == 0:
+                    # No roll observes anything this orbit. The fallback
+                    # attitude _best_roll settled on could never be used,
+                    # so visible stays False and the roll NaN.
                     continue
-                t1_ok &= sep >= lim
 
-            t2_ok = np.ones(N_chunk, dtype=bool)
-            for _, limit, key in st2_checks:
-                lim = limit.to(u.deg).value
-                if key == "sun_angle":
-                    sep = self._fast_sep_deg(st2_eci, bu_inp["sun"])
-                elif key == "moon_angle":
-                    sep = self._fast_sep_deg(st2_eci, bu_inp["moon"])
-                elif key == "earthlimb_angle":
-                    sep = self._fast_limb_deg(st2_eci, zen_inp, limb_inp)
-                else:
-                    continue
-                t2_ok &= sep >= lim
-
-            st_ok_inp = self._combine_tracker_results(t1_ok, t2_ok)
-
-            vis_inp = bs_inp & st_ok_inp
-            out_visible[idx] = vis_inp
-            # Count only the trackers something was asked of, to match the
-            # rule _combine_tracker_results applies just above.
-            passing = sum(
-                (t1_ok if tracker == 1 else t2_ok).astype(int)
-                for tracker in self._trackers_with_checks()
-            )
-            out_nst[idx] = np.where(vis_inp, passing, 0)
-
-            # Solar power at input times
-            cos_sy = np.sum(y_pay[:, np.newaxis] * bu_inp["sun"], axis=0)
-            cos_sy = np.clip(cos_sy, -1.0, 1.0)
-            theta_sy = np.arccos(np.abs(cos_sy))
-            incidence = np.pi / 2 - theta_sy
-            power = np.cos(incidence)
-            out_power[idx] = np.where(vis_inp, power, np.nan)
-            out_roll[idx] = np.where(vis_inp, best_orbit_roll, np.nan)
+                visible = at_input["visible"]
+                out_visible[idx] = visible
+                out_roll[idx] = np.where(visible, chosen["roll_deg"], np.nan)
+                out_nst[idx] = at_input["n_st_pass"]
+                out_power[idx] = at_input["solar_power_frac"]
 
         if is_scalar:
             return {
@@ -1757,14 +1740,12 @@ class Visibility:
             return float(out_roll[0]) if is_scalar else out_roll
 
         roll_degs = np.arange(0, 360, roll_step.to(u.deg).value)
-        roll_rads = np.deg2rad(roll_degs)
 
         # Shares the orbit grouping and its ephemeris with
         # get_visibility_best_roll, so calling both on one time grid pays
         # for the expensive part once.
         grid = self._orbit_sampling_grid(time, orbit_time_step)
         n_orbit_samp = grid["n_orbit_samp"]
-        pre_orbit_all = grid["pre_orbit_all"]
 
         center_xyz = target_coord.transform_to(
             GCRS(obstime=grid["centers"])
@@ -1773,48 +1754,16 @@ class Visibility:
             center_xyz, axis=0, keepdims=True
         )  # (3, n_orbits)
 
-        all_samples = np.ones(n_orbit_samp, dtype=bool)
-
         for position, idx in enumerate(grid["chunk_indices"]):
-            target_unit = center_units[:, position]
-            samples = slice(position * n_orbit_samp,
-                            (position + 1) * n_orbit_samp)
-            body_units = {name: unit[:, samples]
-                          for name, unit in pre_orbit_all["body_units"].items()}
-            zenith_unit = pre_orbit_all["zenith_unit"][:, samples]
-            limb_angle_rad = pre_orbit_all["limb_angle_rad"][samples]
-
-            st_ok, solar = self._orbit_roll_sweep(
-                target_unit, roll_rads, body_units, zenith_unit,
-                limb_angle_rad, n_orbit_samp,
-            )
-
-            # Ask the question get_visibility_best_roll asks first, so the
-            # two agree on every orbit where it found an answer.
-            boresight_ok = self._boresight_ok(
-                target_unit[:, np.newaxis], body_units, zenith_unit,
-                limb_angle_rad,
-            )
-            roll = self._pick_orbit_roll(roll_degs, st_ok, solar,
-                                         boresight_ok)
-
-            if np.isnan(roll):
-                # Nothing was observable this orbit. Rank the rolls on the
-                # trackers alone: they do not care why the boresight was
-                # lost, and the diagnostic still has to name the tracker
-                # that would have failed.
-                roll = self._pick_orbit_roll(roll_degs, st_ok, solar,
-                                             all_samples)
-
-            if np.isnan(roll):
-                # No roll passes a tracker anywhere in the orbit, so there
-                # is no tie for solar power to break. Keep the arrays best
-                # lit instead, which at least leaves the attitude defined
-                # and physically sensible.
-                best = roll_degs[np.argmax(solar.mean(axis=1))]
-                roll = float((best + 180) % 360 - 180)
-
-            out_roll[idx] = roll
+            window = slice(position * n_orbit_samp,
+                           (position + 1) * n_orbit_samp)
+            # The search get_visibility_best_roll runs, whose fallbacks give
+            # an orbit a roll even when nothing was observable there.
+            out_roll[idx] = self._best_roll(
+                center_units[:, position],
+                self._slice_precompute(grid["pre_orbit_all"], window),
+                roll_degs,
+            )["roll_deg"]
 
         return float(out_roll[0]) if is_scalar else out_roll
 
@@ -2067,18 +2016,18 @@ class Visibility:
 
     def _orbit_roll_sweep(self, target_unit, roll_rads, body_units,
                           zenith_unit, limb_angle_rad, n_samples):
-        """Star tracker verdict and solar power for every roll over one orbit.
+        """Star tracker verdict and solar power for every roll over samples.
 
         Parameters
         ----------
         target_unit : np.ndarray
-            (3,) boresight direction, held fixed across the orbit.
+            (3,) boresight direction, held fixed across the samples.
         roll_rads : np.ndarray
             (n_rolls,) roll angles to try, in radians.
         body_units, zenith_unit, limb_angle_rad
-            Precomputed quantities for this orbit's samples.
+            Precomputed quantities for the samples.
         n_samples : int
-            Number of samples in the orbit window.
+            Number of samples.
 
         Returns
         -------
@@ -2087,6 +2036,9 @@ class Visibility:
             combination of trackers passes.
         solar : np.ndarray
             (n_rolls, n_samples) solar array power fraction.
+        tracker_ok : list of np.ndarray
+            The two per-tracker verdicts, (n_rolls, n_samples) each, that
+            ``st_ok`` was reduced from.
         """
         z_col = np.tile(target_unit.reshape(3, 1), (1, n_samples))
         x_payload, y_payload = self._roll_attitude_batch(
@@ -2112,16 +2064,14 @@ class Visibility:
             -1.0, 1.0,
         )
         solar = np.cos(np.pi / 2 - np.arccos(np.abs(cos_sy)))
-        return st_ok, solar
+        return st_ok, solar, tracker_ok
 
     @staticmethod
-    def _pick_orbit_roll(roll_degs, st_ok, solar, usable):
-        """Roll with the most usable samples, average solar power breaking ties.
+    def _pick_roll(st_ok, solar, usable, weights=None):
+        """Row of the roll with the most usable samples, power breaking ties.
 
         Parameters
         ----------
-        roll_degs : np.ndarray
-            (n_rolls,) candidate roll angles in degrees.
         st_ok, solar : np.ndarray
             (n_rolls, n_samples) arrays from ``_orbit_roll_sweep``.
         usable : np.ndarray
@@ -2129,21 +2079,129 @@ class Visibility:
             Pass the boresight verdict to pick the roll that observes the
             most, or all True to ask which roll suits the star trackers
             alone, ignoring whether the boresight was clear.
+        weights : np.ndarray, optional
+            (n_samples,) weight of each sample in the count, default 1.
+            Integer weights keep the count exact, so one group of samples
+            can be ranked strictly above another by giving it a weight
+            larger than the other group's total.
 
         Returns
         -------
-        float
-            Roll in degrees normalized to [-180, 180], or NaN when no roll
-            has a single usable sample.
+        int or None
+            Row of the winning roll, or None when no roll has a single
+            usable sample of nonzero weight.
         """
         good = usable[np.newaxis, :] & st_ok
-        counts = good.sum(axis=1)
-        if counts.max() == 0:
-            return np.nan
-        candidates = np.where(counts == counts.max())[0]
-        avg_power = np.array([solar[r, good[r]].mean() for r in candidates])
-        best = roll_degs[candidates[np.argmax(avg_power)]]
-        return float((best + 180) % 360 - 180)
+        counts = good.sum(axis=1) if weights is None else good @ weights
+        if counts.max() <= 0:
+            return None
+        candidates = np.flatnonzero(counts == counts.max())
+        avg_power = [solar[r, good[r]].mean() for r in candidates]
+        return int(candidates[np.argmax(avg_power)])
+
+    @staticmethod
+    def _slice_precompute(pre: dict, samples) -> dict:
+        """The per-sample parts of a ``_precompute`` dict, cut to ``samples``."""
+        return {
+            "body_units": {name: unit[:, samples]
+                           for name, unit in pre["body_units"].items()},
+            "zenith_unit": pre["zenith_unit"][:, samples],
+            "limb_angle_rad": pre["limb_angle_rad"][samples],
+        }
+
+    def _best_roll(self, target_unit, pre, roll_degs, target_b=None,
+                   min_power_frac=None, weights=None) -> dict:
+        """Best single roll held over one set of precomputed samples.
+
+        The one roll search behind ``get_best_roll``,
+        ``get_visibility_best_roll`` and ``get_orbit_roll_angles``: the
+        roll with the most samples where boresight and trackers pass, the
+        highest mean solar power among ties. When no roll observes a single
+        sample the fallback is the roll best for the trackers alone, then
+        the roll best for power alone, so an attitude is always returned.
+
+        Parameters
+        ----------
+        target_unit : np.ndarray
+            (3,) boresight direction the trackers are swept with, held
+            fixed across the samples.
+        pre : dict
+            ``body_units``, ``zenith_unit`` and ``limb_angle_rad`` for the
+            samples, as ``_precompute`` or ``_slice_precompute`` give them.
+        roll_degs : np.ndarray
+            (n_rolls,) candidate rolls in degrees. A single entry evaluates
+            that roll rather than searching.
+        target_b : np.ndarray, optional
+            (3, n_samples) per-sample boresight directions for the
+            boresight keep-outs; default ``target_unit`` at every sample.
+        min_power_frac : float, optional
+            Rolls whose mean solar power over the samples is below this are
+            not searched. None applies no floor, as does a floor no roll
+            reaches.
+        weights : np.ndarray, optional
+            (n_samples,) sample weights for the count; see ``_pick_roll``.
+
+        Returns
+        -------
+        dict
+            roll_deg : float in [-180, 180].
+            n_visible : int, samples visible at that roll.
+            visible, boresight_visible : (n_samples,) bool.
+            n_st_pass : (n_samples,) int, constrained trackers passing
+                where visible, else 0.
+            solar_power_frac : (n_samples,) float, NaN where not visible.
+        """
+        body_units = pre["body_units"]
+        zenith_unit = pre["zenith_unit"]
+        limb_angle_rad = pre["limb_angle_rad"]
+        n_samples = zenith_unit.shape[1]
+        if target_b is None:
+            target_b = target_unit[:, np.newaxis]
+
+        boresight_ok = self._boresight_ok(
+            target_b, body_units, zenith_unit, limb_angle_rad
+        )
+        st_ok, solar, tracker_ok = self._orbit_roll_sweep(
+            target_unit, np.deg2rad(roll_degs), body_units, zenith_unit,
+            limb_angle_rad, n_samples,
+        )
+        mean_power = solar.mean(axis=1)
+        allowed = np.ones(len(roll_degs), dtype=bool)
+        if min_power_frac is not None:
+            floor_ok = mean_power >= min_power_frac
+            if floor_ok.any():
+                allowed = floor_ok
+        searchable = st_ok & allowed[:, np.newaxis]
+
+        best = self._pick_roll(searchable, solar, boresight_ok, weights)
+        if best is None:
+            # Nothing observable at any roll. Rank on the trackers alone:
+            # they do not care why the boresight was lost, and a diagnostic
+            # still has to name the tracker that would have failed.
+            best = self._pick_roll(
+                searchable, solar, np.ones(n_samples, dtype=bool), weights
+            )
+        if best is None:
+            # No tracker passes anywhere, so there is no tie for solar
+            # power to break. Keep the arrays best lit instead, which at
+            # least leaves the attitude defined and physically sensible.
+            best = int(np.argmax(np.where(allowed, mean_power, -np.inf)))
+
+        visible = boresight_ok & st_ok[best]
+        # Count only the trackers something was asked of, to match the
+        # rule _combine_tracker_results applies inside the sweep.
+        passing = sum(
+            tracker_ok[tracker - 1][best].astype(int)
+            for tracker in self._trackers_with_checks()
+        )
+        return {
+            "roll_deg": float((roll_degs[best] + 180) % 360 - 180),
+            "n_visible": int(visible.sum()),
+            "visible": visible,
+            "boresight_visible": boresight_ok,
+            "n_st_pass": np.where(visible, passing, 0),
+            "solar_power_frac": np.where(visible, solar[best], np.nan),
+        }
 
     def _sweep_tracker(self, x_payload, y_payload, z_col, st_body, checks,
                        body_units, zenith_unit, limb_rad):

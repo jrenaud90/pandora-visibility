@@ -1569,6 +1569,158 @@ class TestBestRoll:
         assert scalar_result["boresight_visible"] == array_result["boresight_visible"][0]
 
 
+def _mean_power(vis, target_coord, times, roll_deg):
+    """Mean solar array power fraction over *times* at a held roll.
+
+    The panel model get_best_roll ranks by, written out so the tests can
+    ask about rolls the search did not choose.
+    """
+    pre = vis._precompute(times)
+    unit = target_coord.transform_to(GCRS(obstime=times[0])).cartesian.xyz.value
+    unit = unit / np.linalg.norm(unit)
+    _, y_payload = vis._roll_attitude(unit, np.deg2rad(roll_deg))
+    cos_sy = np.clip(y_payload @ pre["body_units"]["sun"], -1.0, 1.0)
+    return float(np.mean(np.cos(np.pi / 2 - np.arccos(np.abs(cos_sy)))))
+
+
+class TestGetBestRoll:
+    """get_best_roll: one roll held over every timestep it is given."""
+
+    @pytest.fixture
+    def vis_st(self):
+        return Visibility(
+            _BR_LINE1, _BR_LINE2,
+            st_sun_min=44 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_moon_min=12 * u.deg,
+        )
+
+    @pytest.fixture
+    def target_coord(self):
+        return SkyCoord(79.17305002, 45.99514569, frame="icrs", unit="deg")
+
+    @pytest.fixture
+    def times(self):
+        return Time("2025-01-01T00:00:00") + np.arange(300) * u.min
+
+    def test_agrees_with_get_visibility_at_that_roll(
+        self, vis_st, target_coord, times
+    ):
+        """visible and n_visible are what get_visibility says at the roll."""
+        result = vis_st.get_best_roll(target_coord, times)
+        held = vis_st.get_visibility(
+            target_coord, times, roll=result["roll_deg"] * u.deg
+        )
+        np.testing.assert_array_equal(result["visible"], held)
+        assert result["n_visible"] == int(held.sum()) > 0
+        assert -180 <= result["roll_deg"] <= 180
+        assert np.all(result["n_st_pass"][result["visible"]] >= 1)
+        assert np.all(result["n_st_pass"][~result["visible"]] == 0)
+        assert np.all(np.isnan(result["solar_power_frac"][~result["visible"]]))
+
+    def test_no_single_roll_observes_more(self, vis_st, target_coord, times):
+        """Brute force over the same roll grid finds nothing better."""
+        result = vis_st.get_best_roll(target_coord, times, roll_step=10 * u.deg)
+        for roll in np.arange(0, 360, 10):
+            held = vis_st.get_visibility(target_coord, times, roll=roll * u.deg)
+            assert int(held.sum()) <= result["n_visible"]
+
+    def test_ties_go_to_solar_power(self, vis_st, target_coord, times):
+        """Among the rolls observing the most, the best lit one wins."""
+        result = vis_st.get_best_roll(target_coord, times, roll_step=10 * u.deg)
+        chosen = np.nanmean(result["solar_power_frac"])
+        for roll in np.arange(0, 360, 10):
+            held = vis_st.get_visibility(target_coord, times, roll=roll * u.deg)
+            if int(held.sum()) == result["n_visible"]:
+                assert _mean_power(vis_st, target_coord, times[held], roll) <= (
+                    chosen + 1e-12
+                )
+
+    def test_power_floor_is_met(self, vis_st, target_coord, times):
+        """A floor some roll reaches is respected; one none reaches is ignored."""
+        floored = vis_st.get_best_roll(target_coord, times, min_power_frac=0.9)
+        assert _mean_power(vis_st, target_coord, times, floored["roll_deg"]) >= 0.9
+        impossible = vis_st.get_best_roll(target_coord, times, min_power_frac=1.0)
+        assert np.isfinite(impossible["roll_deg"])
+        with pytest.raises(ValueError):
+            vis_st.get_best_roll(target_coord, times, min_power_frac=1.5)
+
+    def test_weights_rank_one_group_first(self, vis_st, target_coord, times):
+        """Heavily weighted timesteps decide the roll; the rest break ties."""
+        first_hour = np.zeros(len(times), dtype=bool)
+        first_hour[:60] = True
+        weights = np.where(first_hour, len(times) + 1, 1)
+        result = vis_st.get_best_roll(
+            target_coord, times, roll_step=10 * u.deg, weights=weights
+        )
+        best_first_hour = max(
+            int(vis_st.get_visibility(
+                target_coord, times[first_hour], roll=roll * u.deg
+            ).sum())
+            for roll in np.arange(0, 360, 10)
+        )
+        assert int(result["visible"][first_hour].sum()) == best_first_hour
+        with pytest.raises(ValueError):
+            vis_st.get_best_roll(target_coord, times, weights=weights[:-1])
+
+    def test_fallback_when_nothing_observable(self, target_coord, times):
+        """A blocked boresight still returns a roll, with n_visible 0."""
+        vis = Visibility(
+            _BR_LINE1, _BR_LINE2,
+            sun_min=170 * u.deg,
+            st_sun_min=44 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_moon_min=12 * u.deg,
+        )
+        result = vis.get_best_roll(target_coord, times)
+        assert not result["boresight_visible"].any(), "expected a blocked run"
+        assert result["n_visible"] == 0 and not result["visible"].any()
+        assert np.isfinite(result["roll_deg"])
+        assert np.all(np.isnan(result["solar_power_frac"]))
+        assert np.all(result["n_st_pass"] == 0)
+
+    def test_trackers_off_picks_best_lit(self, target_coord, times):
+        """Without tracker keep-outs every roll observes the same, so power decides."""
+        vis = _legacy_visibility(_BR_LINE1, _BR_LINE2)
+        result = vis.get_best_roll(target_coord, times, roll_step=10 * u.deg)
+        np.testing.assert_array_equal(
+            result["visible"], vis.get_visibility(target_coord, times)
+        )
+        np.testing.assert_array_equal(result["visible"], result["boresight_visible"])
+        assert np.all(result["n_st_pass"] == 0)
+        chosen = _mean_power(vis, target_coord, times, result["roll_deg"])
+        for roll in np.arange(0, 360, 10):
+            assert _mean_power(vis, target_coord, times, roll) <= chosen + 1e-12
+
+    def test_scalar_time(self, vis_st, target_coord):
+        """A scalar time returns scalars."""
+        result = vis_st.get_best_roll(target_coord, Time("2025-01-01T00:00:00"))
+        assert isinstance(result["visible"], bool)
+        assert isinstance(result["boresight_visible"], bool)
+        assert isinstance(result["n_st_pass"], int)
+        assert isinstance(result["solar_power_frac"], float)
+        assert isinstance(result["roll_deg"], float)
+
+    def test_orbit_wrapper_is_get_best_roll_over_the_window(
+        self, vis_st, target_coord
+    ):
+        """get_visibility_best_roll chooses as get_best_roll would over the orbit."""
+        times = Time("2025-01-01T00:00:00") + np.arange(40) * u.min
+        result = vis_st.get_visibility_best_roll(target_coord, times)
+        chosen = np.isfinite(result["roll_deg"])
+        assert chosen.any()
+        roll = result["roll_deg"][chosen][0]
+
+        period = vis_st.get_period().to(u.min).value
+        center = Time((times.jd.min() + times.jd.max()) / 2, format="jd",
+                      scale=times.scale)
+        n_samples = int(np.ceil(period)) + 1
+        window = center + np.linspace(-period / 2, period / 2, n_samples) * u.min
+        held = vis_st.get_best_roll(target_coord, window)
+        observed = vis_st.get_visibility(target_coord, window, roll=roll * u.deg)
+        assert int(observed.sum()) == held["n_visible"]
+
+
 class TestEarthlimbDayNight:
     """Tests for earthlimb_day_min / earthlimb_night_min parameters."""
 
