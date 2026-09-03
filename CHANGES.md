@@ -1,4 +1,5 @@
 # v1.4.0 (2026-08-28)
+- Adds `version` and `__version__` into the main package init.py so versions can be checked easily.
 - Added `get_best_roll`, the best single roll held over every timestep it is given: the roll with the most timesteps where the boresight keep-outs and the star trackers pass, ties going to the highest mean solar power. `get_visibility_best_roll` makes that same choice once per orbit window and may change roll between orbits; an observation that must hold one attitude across several orbits (the short-term scheduler's one-roll-per-target-per-visit rule) calls this instead.
     - `min_power_frac` drops rolls whose mean solar power over the timesteps is below it before the search. A floor no roll reaches is ignored rather than leaving the attitude undefined.
     - `weights` gives each timestep a weight in the count. Integer weights keep the count exact, so a caller can rank one group of timesteps strictly first (weight larger than the other group's total) and let the other group break ties.

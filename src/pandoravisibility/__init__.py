@@ -3,6 +3,10 @@ import os
 PACKAGEDIR = os.path.abspath(os.path.dirname(__file__))
 TESTDIR = "/".join(PACKAGEDIR.split("/")[:-2]) + "/tests/"
 
+# Find Version Number
+import importlib.metadata
+__version__ = importlib.metadata.version("pandoravisibility")
+version = __version__
 
 from .utils import analyze_target_yearly_visibility  # noqa: E402, F401
 from .utils import (
