@@ -84,7 +84,7 @@ def test_target():
     from astropy.coordinates import SkyCoord
 
     target_coord = SkyCoord(79.17305002, 45.99514569, frame="icrs", unit="deg")
-    targ_vis = vis.get_visibility(target_coord, times)
+    targ_vis = vis.get_visibility(target_coord, times)["visible"]
 
     assert int(targ_vis.shape[0]) == 144
     assert targ_vis.astype(int).sum() == 78
@@ -121,7 +121,7 @@ def test_custom_limits():
     from astropy.coordinates import SkyCoord
 
     target_coord = SkyCoord(79.17305002, 45.99514569, frame="icrs", unit="deg")
-    targ_vis = vis.get_visibility(target_coord, times)
+    targ_vis = vis.get_visibility(target_coord, times)["visible"]
 
     assert int(targ_vis.shape[0]) == 144
     assert targ_vis.astype(int).sum() == 90
@@ -146,11 +146,11 @@ def test_edge_cases():
         **{**_LEGACY_DEFAULTS, "moon_min": 0 * u.deg, "sun_min": 0 * u.deg,
            "earthlimb_min": -90 * u.deg},
     )
-    result = vis_zero.get_visibility(target_coord, time)
+    result = vis_zero.get_visibility(target_coord, time)["visible"]
     assert isinstance(result, bool)
     assert result is True
 
     # Test with very high constraints (should always fail)
     vis_high = Visibility(line1, line2, moon_min=180 * u.deg)
-    result = vis_high.get_visibility(target_coord, time)
+    result = vis_high.get_visibility(target_coord, time)["visible"]
     assert result is False
