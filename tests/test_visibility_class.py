@@ -1345,8 +1345,15 @@ class TestMergedResultDict:
             "n_visible",
             "n_st_pass",
             "solar_power_frac",
+            "trace_contamination",
+            "trace_ok",
+            "trace_min_contamination",
+            "trace_min_roll_deg",
         }
         assert np.all(np.isnan(result["roll_deg"]))
+        # The trace check only runs in the optimize_roll search
+        assert np.all(np.isnan(result["trace_contamination"]))
+        assert np.all(result["trace_ok"])
         vis_mask = result["visible"]
         assert result["n_visible"] == int(vis_mask.sum())
         np.testing.assert_allclose(result["solar_power_frac"][vis_mask], 1.0)
@@ -1465,6 +1472,10 @@ class TestOptimizeRoll:
             "n_visible",
             "n_st_pass",
             "solar_power_frac",
+            "trace_contamination",
+            "trace_ok",
+            "trace_min_contamination",
+            "trace_min_roll_deg",
         }
         assert isinstance(result["visible"], bool)
         assert isinstance(result["boresight_visible"], bool)

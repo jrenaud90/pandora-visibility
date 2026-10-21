@@ -42,6 +42,7 @@ __all__ = [
     "run_stats",
     "mask_segments",
     "draw_row",
+    "draw_split_row",
     "draw_event_box",
     "format_date_axis",
     "label_rows",
@@ -738,6 +739,48 @@ def draw_row(ax, row, segments, color):
     ax.broken_barh(
         segments, (row - BAR_HEIGHT / 2, BAR_HEIGHT), facecolors=color, zorder=3
     )
+
+
+def draw_split_row(ax, row, times, visible, roll_deg, step_minutes, cmap):
+    """
+    Draw a two-part row: visibility on top, the roll held underneath.
+
+    The upper half is green wherever *visible*; the lower half colors
+    every timestep with a finite *roll_deg* by its roll on the cyclic
+    *cmap* (0 to 360 deg), one bar per run of constant roll.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to draw on (rows run top to bottom, as set by
+        :func:`label_rows`).
+    row : int
+        Row index, matching the order of the y tick labels.
+    times : astropy.time.Time
+        Time grid matching *visible* and *roll_deg*.
+    visible : array_like of bool
+        Per-timestep visibility.
+    roll_deg : array_like of float
+        Roll held at each timestep, in degrees; NaN leaves a gap.
+    step_minutes : float
+        Grid spacing, see :func:`mask_segments`.
+    cmap : matplotlib.colors.Colormap
+        Cyclic colormap, e.g. ``plt.get_cmap("twilight")``.
+    """
+    ax.broken_barh(
+        mask_segments(times, visible, step_minutes),
+        (row - BAR_HEIGHT, BAR_HEIGHT),
+        facecolors="tab:green",
+        zorder=3,
+    )
+    wrapped = np.mod(np.asarray(roll_deg, dtype=float), 360.0)
+    for roll in np.unique(wrapped[np.isfinite(wrapped)]):
+        ax.broken_barh(
+            mask_segments(times, wrapped == roll, step_minutes),
+            (row, BAR_HEIGHT),
+            facecolors=cmap(roll / 360.0),
+            zorder=3,
+        )
 
 
 def draw_event_box(ax, row, segments, color, alpha=0.30):

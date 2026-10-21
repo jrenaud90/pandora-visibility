@@ -5,6 +5,8 @@ from astropy.coordinates import GCRS, TEME, EarthLocation, SkyCoord, get_body
 from astropy.time import Time
 from sgp4.api import SGP4_ERRORS, Satrec
 
+from . import star_field, trace
+
 __all__ = ["Visibility"]
 
 _R_EARTH_M = R_earth.to(u.m).value
@@ -138,6 +140,13 @@ class Visibility:
     # and interpolates, which is much faster (see _precompute).
     EPHEMERIS_STEP = None
 
+    # NIRDA trace contamination check in the optimize_roll search. The model's
+    # other settings are module constants in trace.py and star_field.py.
+    USE_TRACE_SWEEP = True
+    TRACE_CONTAMINATION_TOL = 1.0e-3  # worst-channel contaminating / target flux
+    NIRDA_ROI_X = 80  # NIRDA ROI columns (across the dispersion)
+    NIRDA_ROI_Y = 256  # NIRDA ROI rows (along the dispersion)
+
     def __init__(self, line1: str, line2: str, **custom_limits):
         """
         Initialize the TLE object with the two lines of TLE data.
@@ -158,6 +167,14 @@ class Visibility:
             tens of degrees, and the spacecraft's own motion is never
             interpolated.  ``None`` (the default) evaluates them exactly at
             every timestep.
+
+            ``use_trace_sweep`` (default True) makes the
+            ``optimize_roll=True`` search reject rolls where neighbor stars'
+            NIRDA traces put more than ``trace_contamination_tol`` (default
+            1e-3) of the target's flux into its extraction aperture, within
+            an ``nirda_roi_x`` x ``nirda_roi_y`` ROI (default 80 x 256). The
+            neighbors come from the local gaiaoffline Gaia DR3 database,
+            which must be installed; see ``trace.py``.
         """
         # Validate TLE lines
         if not line1 or not line2:
@@ -240,6 +257,25 @@ class Visibility:
         self.ephemeris_step = custom_limits.get("ephemeris_step", self.EPHEMERIS_STEP)
         if self.ephemeris_step is not None:
             _validate_time_quantity(self.ephemeris_step, "ephemeris_step")
+
+        # NIRDA trace contamination check (see trace.py)
+        self.use_trace_sweep = bool(
+            custom_limits.get("use_trace_sweep", self.USE_TRACE_SWEEP)
+        )
+        self.trace_contamination_tol = float(
+            custom_limits.get("trace_contamination_tol", self.TRACE_CONTAMINATION_TOL)
+        )
+        if not self.trace_contamination_tol > 0:
+            raise ValueError(
+                "trace_contamination_tol must be positive, "
+                f"got {self.trace_contamination_tol}"
+            )
+        self.nirda_roi_x = int(custom_limits.get("nirda_roi_x", self.NIRDA_ROI_X))
+        self.nirda_roi_y = int(custom_limits.get("nirda_roi_y", self.NIRDA_ROI_Y))
+        # Raises if the ROI cannot hold the target pivot
+        trace.roi_window(self.nirda_roi_x, self.nirda_roi_y)
+        # Neighbor star fields per target and epoch; see _trace_field
+        self._trace_field_cache = {}
 
         # One-entry cache for time-dependent quantities reused across calls.
         # The Time object itself is held so its identity stays meaningful:
@@ -1058,6 +1094,9 @@ class Visibility:
         n_time = tgt_b.shape[1]
 
         if optimize_roll:
+            trace_field = (
+                self._trace_field(target_coord, time) if self.use_trace_sweep else None
+            )
             result = self._best_roll(
                 tgt_unit,
                 pre,
@@ -1065,9 +1104,17 @@ class Visibility:
                 target_b=tgt_b,
                 min_power_frac=min_power_frac,
                 weights=weights,
+                trace_field=trace_field,
             )
             # One chosen roll, reported per timestep like every other field.
-            result["roll_deg"] = np.full(n_time, result["roll_deg"])
+            for key in (
+                "roll_deg",
+                "trace_contamination",
+                "trace_ok",
+                "trace_min_contamination",
+                "trace_min_roll_deg",
+            ):
+                result[key] = np.full(n_time, result[key])
             return result
 
         boresight = self._boresight_ok(
@@ -1133,7 +1180,30 @@ class Visibility:
             "boresight_visible": boresight,
             "n_st_pass": n_st_pass,
             "solar_power_frac": np.where(visible, power, np.nan),
+            # The trace check only runs in the optimize_roll search
+            "trace_contamination": np.full(n_time, np.nan),
+            "trace_ok": np.ones(n_time, dtype=bool),
+            "trace_min_contamination": np.full(n_time, np.nan),
+            "trace_min_roll_deg": np.full(n_time, np.nan),
         }
+
+    def _trace_field(self, target_coord: SkyCoord, time: Time):
+        """Neighbor star field for the trace check, cached per target and epoch.
+
+        The field changes only through proper motion, so one query per target
+        per 0.1 yr serves every call, e.g. one call per day of a long run. A
+        target without a Gaia star is cached as None too, so its warning is
+        issued once.
+        """
+        icrs = target_coord.icrs
+        key = (
+            round(float(icrs.ra.deg), 7),
+            round(float(icrs.dec.deg), 7),
+            round(float(np.mean(time.jyear)), 1),
+        )
+        if key not in self._trace_field_cache:
+            self._trace_field_cache[key] = star_field.query_field(target_coord, time)
+        return self._trace_field_cache[key]
 
     def _payload_axes(self, tgt_unit, time, effective_roll, sun_vec):
         """Payload X/Y/Z axes for the attitude in effect, plus degeneracy.
@@ -1382,6 +1452,14 @@ class Visibility:
           roll are chosen in turn, so the attitude is always defined;
           ``n_visible`` says whether it observes anything.
 
+          With the instance's ``use_trace_sweep`` on (the default), the
+          rolls observing at least one timestep are ranked as above and
+          the first whose NIRDA trace contamination (``trace.py``) is
+          within ``trace_contamination_tol`` is held instead. If none is,
+          the top-ranked roll is reported and nothing is visible
+          (``trace_ok`` False). A target without a Gaia star skips the
+          check with a warning.
+
         The chosen roll is optimized over exactly the timesteps given:
         adding, removing or thinning timesteps can change it, and with it
         the verdict at every other timestep. Make one call per
@@ -1446,6 +1524,19 @@ class Visibility:
                 (a Sun-aligned target under the Sun-constrained attitude,
                 or a NaN entry in a per-timestep roll). The
                 Sun-constrained attitude gives exactly 1 by construction.
+            trace_contamination : float or np.ndarray
+                Robust worst-channel NIRDA trace contamination
+                (contaminating / target flux) at the reported roll. NaN
+                where the trace check did not run: no ``optimize_roll``,
+                ``use_trace_sweep`` off, or no Gaia star at the target.
+            trace_ok : bool or np.ndarray
+                False where the reported roll fails the trace check, which
+                then makes every timestep not visible. True where the check
+                passed or did not run.
+            trace_min_contamination, trace_min_roll_deg : float or np.ndarray
+                The lowest trace contamination over every swept roll, and
+                the roll in [-180, 180] that reaches it, whether or not that
+                roll observes anything. NaN where the check did not run.
 
         Examples
         --------
@@ -1525,25 +1616,23 @@ class Visibility:
                 )
                 for tc in targets
             ]
+            per_timestep_keys = (
+                "visible",
+                "boresight_visible",
+                "roll_deg",
+                "n_st_pass",
+                "solar_power_frac",
+                "trace_contamination",
+                "trace_ok",
+                "trace_min_contamination",
+                "trace_min_roll_deg",
+            )
             result = {
-                key: np.stack([r[key] for r in per_target])
-                for key in (
-                    "visible",
-                    "boresight_visible",
-                    "roll_deg",
-                    "n_st_pass",
-                    "solar_power_frac",
-                )
+                key: np.stack([r[key] for r in per_target]) for key in per_timestep_keys
             }
             result["n_visible"] = np.array([r["n_visible"] for r in per_target])
             if is_scalar_time:
-                for key in (
-                    "visible",
-                    "boresight_visible",
-                    "roll_deg",
-                    "n_st_pass",
-                    "solar_power_frac",
-                ):
+                for key in per_timestep_keys:
                     result[key] = result[key][:, 0]
             return result
 
@@ -1566,6 +1655,10 @@ class Visibility:
                 "n_visible": result["n_visible"],
                 "n_st_pass": int(result["n_st_pass"][0]),
                 "solar_power_frac": float(result["solar_power_frac"][0]),
+                "trace_contamination": float(result["trace_contamination"][0]),
+                "trace_ok": bool(result["trace_ok"][0]),
+                "trace_min_contamination": float(result["trace_min_contamination"][0]),
+                "trace_min_roll_deg": float(result["trace_min_roll_deg"][0]),
             }
         return result
 
@@ -1871,6 +1964,33 @@ class Visibility:
         return st_ok, solar, tracker_ok
 
     @staticmethod
+    def _rank_rolls(st_ok, solar, usable, weights=None):
+        """Rows of every roll with a usable sample, best first.
+
+        Ranked by usable-sample count, then mean solar power over those
+        samples, then row, so the first entry is the roll ``_pick_roll``
+        picks. The trace check steps down this list.
+
+        Parameters
+        ----------
+        st_ok, solar, usable, weights
+            As for ``_pick_roll``.
+
+        Returns
+        -------
+        np.ndarray
+            Rows of the rolls with a nonzero count, best first; empty when
+            no roll has a usable sample of nonzero weight.
+        """
+        good = usable[np.newaxis, :] & st_ok
+        counts = good.sum(axis=1) if weights is None else good @ weights
+        candidates = np.flatnonzero(counts > 0)
+        avg_power = np.array([solar[r, good[r]].mean() for r in candidates])
+        # lexsort orders by its last key first
+        order = np.lexsort((candidates, -avg_power, -counts[candidates]))
+        return candidates[order]
+
+    @staticmethod
     def _pick_roll(st_ok, solar, usable, weights=None):
         """Row of the roll with the most usable samples, power breaking ties.
 
@@ -1895,13 +2015,8 @@ class Visibility:
             Row of the winning roll, or None when no roll has a single
             usable sample of nonzero weight.
         """
-        good = usable[np.newaxis, :] & st_ok
-        counts = good.sum(axis=1) if weights is None else good @ weights
-        if counts.max() <= 0:
-            return None
-        candidates = np.flatnonzero(counts == counts.max())
-        avg_power = [solar[r, good[r]].mean() for r in candidates]
-        return int(candidates[np.argmax(avg_power)])
+        order = Visibility._rank_rolls(st_ok, solar, usable, weights)
+        return int(order[0]) if order.size else None
 
     def _best_roll(
         self,
@@ -1911,6 +2026,7 @@ class Visibility:
         target_b=None,
         min_power_frac=None,
         weights=None,
+        trace_field=None,
     ) -> dict:
         """Best single roll held over one set of precomputed samples.
 
@@ -1919,6 +2035,11 @@ class Visibility:
         highest mean solar power among ties. When no roll observes a single
         sample the fallback is the roll best for the trackers alone, then
         the roll best for power alone, so an attitude is always returned.
+
+        With a ``trace_field``, the rolls observing at least one sample are
+        taken in that ranking and the first whose NIRDA trace contamination
+        is within ``trace_contamination_tol`` wins. When none is, the
+        top-ranked roll is kept and nothing is visible.
 
         Parameters
         ----------
@@ -1940,6 +2061,9 @@ class Visibility:
             reaches.
         weights : np.ndarray, optional
             (n_samples,) sample weights for the count; see ``_pick_roll``.
+        trace_field : dict, optional
+            Neighbor stars from ``star_field.query_field``; None skips the
+            trace check.
 
         Returns
         -------
@@ -1950,6 +2074,13 @@ class Visibility:
             n_st_pass : (n_samples,) int, constrained trackers passing
                 where visible, else 0.
             solar_power_frac : (n_samples,) float, NaN where not visible.
+            trace_contamination : float, robust trace contamination at
+                that roll (NaN without a trace check).
+            trace_ok : bool, whether that roll passes the trace check
+                (True without one).
+            trace_min_contamination, trace_min_roll_deg : float, the lowest
+                contamination over every swept roll and its roll in
+                [-180, 180] (NaN without a trace check).
         """
         body_units = pre["body_units"]
         zenith_unit = pre["zenith_unit"]
@@ -1977,7 +2108,18 @@ class Visibility:
                 allowed = floor_ok
         searchable = st_ok & allowed[:, np.newaxis]
 
-        best = self._pick_roll(searchable, solar, boresight_ok, weights)
+        order = self._rank_rolls(searchable, solar, boresight_ok, weights)
+        best = int(order[0]) if order.size else None
+        trace_score = None
+        if trace_field is not None:
+            # Every swept roll is scored in one vectorized call; the ranking
+            # then decides which clean roll is held.
+            trace_score = trace.robust_contamination(
+                roll_degs, trace_field, self.nirda_roi_x, self.nirda_roi_y
+            )
+            clean = order[trace_score[order] <= self.trace_contamination_tol]
+            if clean.size:
+                best = int(clean[0])
         if best is None:
             # Nothing observable at any roll. Rank on the trackers alone:
             # they do not care why the boresight was lost, and a diagnostic
@@ -1992,6 +2134,17 @@ class Visibility:
             best = int(np.argmax(np.where(allowed, mean_power, -np.inf)))
 
         visible = boresight_ok & st_ok[best]
+        if trace_score is None:
+            trace_ok = True
+            trace_contamination = trace_min = trace_min_roll = np.nan
+        else:
+            trace_contamination = float(trace_score[best])
+            trace_ok = trace_contamination <= self.trace_contamination_tol
+            # A roll that fails the trace check observes nothing
+            visible &= trace_ok
+            least = int(np.argmin(trace_score))
+            trace_min = float(trace_score[least])
+            trace_min_roll = float((roll_degs[least] + 180) % 360 - 180)
         # Count only the trackers something was asked of, to match the
         # rule _combine_tracker_results applies inside the sweep.
         passing = sum(
@@ -2005,6 +2158,10 @@ class Visibility:
             "boresight_visible": boresight_ok,
             "n_st_pass": np.where(visible, passing, 0),
             "solar_power_frac": np.where(visible, solar[best], np.nan),
+            "trace_contamination": trace_contamination,
+            "trace_ok": trace_ok,
+            "trace_min_contamination": trace_min,
+            "trace_min_roll_deg": trace_min_roll,
         }
 
     def _sweep_tracker(
