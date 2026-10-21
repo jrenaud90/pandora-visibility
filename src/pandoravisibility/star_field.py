@@ -20,7 +20,7 @@ from astropy.coordinates import SkyCoord
 from astropy.time import Time
 from gaiaoffline import Gaia
 
-__all__ = ["query_field", "estimate_jmag", "gnomonic_offsets"]
+__all__ = ["query_field", "query_stars", "estimate_jmag", "gnomonic_offsets"]
 
 # =====================================================================================
 # Field selection
@@ -167,28 +167,22 @@ def query_field(target_coord: SkyCoord, time: Time):
     FileNotFoundError
         If the gaiaoffline database is not installed.
     """
-    _check_database()
     ra0 = float(target_coord.icrs.ra.deg)
     dec0 = float(target_coord.icrs.dec.deg)
-    search_radius_deg = FIELD_RADIUS_ARCMIN / 60.0 + TARGET_MATCH_RADIUS_ARCSEC / 3600.0
-    with Gaia(photometry_output="mag") as gaia:
-        stars = gaia.conesearch(ra=ra0, dec=dec0, radius=search_radius_deg)
-
-    ra = stars["ra"].to_numpy(dtype=float)
-    dec = stars["dec"].to_numpy(dtype=float)
-    g_mag = stars["phot_g_mean_mag"].to_numpy(dtype=float)
-    bp_rp = (stars["phot_bp_mean_mag"] - stars["phot_rp_mean_mag"]).to_numpy(
-        dtype=float
-    )
-    pmra = np.nan_to_num(stars["pmra"].to_numpy(dtype=float))  # includes cos(dec)
-    pmdec = np.nan_to_num(stars["pmdec"].to_numpy(dtype=float))
     epoch = float(np.mean(np.atleast_1d(time.jyear)))
+    stars = _read_cone(
+        ra0,
+        dec0,
+        FIELD_RADIUS_ARCMIN / 60.0 + TARGET_MATCH_RADIUS_ARCSEC / 3600.0,
+        epoch,
+    )
+    pmra, pmdec, g_mag = stars["pmra"], stars["pmdec"], stars["g_mag"]
 
     # Identify the target as the brightest star whose track passes near the
     # coordinate. Offsets move linearly in time, p(t) = p_2016 + v (t - 2016),
     # so the closest approach is at t* = 2016 - (p_2016 . v) / |v|^2, clamped
     # to the span searched.
-    xi_gaia, eta_gaia = gnomonic_offsets(ra, dec, ra0, dec0)
+    xi_gaia, eta_gaia = gnomonic_offsets(stars["ra"], stars["dec"], ra0, dec0)
     speed_xi, speed_eta = pmra / 1000.0, pmdec / 1000.0  # arcsec per year
     speed_sq = speed_xi**2 + speed_eta**2
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -211,23 +205,101 @@ def query_field(target_coord: SkyCoord, time: Time):
         return None
     target = near[np.argmin(g_mag[near])]
 
-    # Carry every star along its proper motion to the observation epoch
-    years = epoch - GAIA_EPOCH_JYEAR
-    dec_now = dec + pmdec * years / 3.6e6
-    ra_now = ra + pmra * years / 3.6e6 / np.cos(np.deg2rad(dec))
+    # Offsets from the target, both at the observation epoch
+    ra_now, dec_now, jmag = stars["ra_now"], stars["dec_now"], stars["jmag"]
     xi, eta = gnomonic_offsets(ra_now, dec_now, ra_now[target], dec_now[target])
-
-    jmag = estimate_jmag(g_mag, bp_rp)
     keep = (
-        (np.arange(len(stars)) != target)
+        (np.arange(len(jmag)) != target)
         & (jmag < FIELD_J_LIMIT)
         & (np.hypot(xi, eta) <= FIELD_RADIUS_ARCMIN * 60.0)
     )
     return {
-        "target_source_id": int(stars["source_id"].iloc[target]),
+        "target_source_id": int(stars["source_id"][target]),
         "target_jmag": float(jmag[target]),
         "xi": xi[keep],
         "eta": eta[keep],
         "jmag": jmag[keep],
         "flux_ratio": 10.0 ** (-0.4 * (jmag[keep] - jmag[target])),
+    }
+
+
+def query_stars(center: SkyCoord, time: Time):
+    """Gaia stars around any sky position, positioned at the observation epoch.
+
+    For targets that are not themselves Gaia stars, such as planets and their
+    moons: no target is matched, and offsets are measured from ``center``.
+    Selection, proper motion and J estimates are as in ``query_field``.
+
+    Parameters
+    ----------
+    center : SkyCoord
+        Position (scalar) the offsets are measured from.
+    time : astropy.time.Time
+        Observation time(s); their mean sets the epoch.
+
+    Returns
+    -------
+    dict
+        xi, eta : np.ndarray
+            (n,) offsets from ``center`` in arcsec, east and north, of the
+            stars within ``FIELD_RADIUS_ARCMIN`` and below ``FIELD_J_LIMIT``.
+        jmag : np.ndarray
+            (n,) their estimated J.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the gaiaoffline database is not installed.
+    """
+    ra0 = float(center.icrs.ra.deg)
+    dec0 = float(center.icrs.dec.deg)
+    epoch = float(np.mean(np.atleast_1d(time.jyear)))
+    stars = _read_cone(ra0, dec0, FIELD_RADIUS_ARCMIN / 60.0, epoch)
+    xi, eta = gnomonic_offsets(stars["ra_now"], stars["dec_now"], ra0, dec0)
+    keep = (stars["jmag"] < FIELD_J_LIMIT) & (
+        np.hypot(xi, eta) <= FIELD_RADIUS_ARCMIN * 60.0
+    )
+    return {"xi": xi[keep], "eta": eta[keep], "jmag": stars["jmag"][keep]}
+
+
+def _read_cone(ra0, dec0, radius_deg, epoch):
+    """Gaia stars in a cone, with J estimates and positions at ``epoch``.
+
+    Every star is moved along its Gaia proper motion (linear, adequate for
+    arcseconds over decades against 1.19 arcsec pixels) from J2016 to
+    ``epoch`` (Julian years).
+
+    Returns
+    -------
+    dict of np.ndarray
+        source_id, ra, dec (J2016, deg), pmra, pmdec (mas/yr, NaN as 0),
+        g_mag, jmag, and ra_now, dec_now (deg at ``epoch``).
+
+    Raises
+    ------
+    FileNotFoundError
+        If the gaiaoffline database is not installed.
+    """
+    _check_database()
+    with Gaia(photometry_output="mag") as gaia:
+        stars = gaia.conesearch(ra=ra0, dec=dec0, radius=radius_deg)
+    ra = stars["ra"].to_numpy(dtype=float)
+    dec = stars["dec"].to_numpy(dtype=float)
+    pmra = np.nan_to_num(stars["pmra"].to_numpy(dtype=float))  # includes cos(dec)
+    pmdec = np.nan_to_num(stars["pmdec"].to_numpy(dtype=float))
+    g_mag = stars["phot_g_mean_mag"].to_numpy(dtype=float)
+    bp_rp = (stars["phot_bp_mean_mag"] - stars["phot_rp_mean_mag"]).to_numpy(
+        dtype=float
+    )
+    years = epoch - GAIA_EPOCH_JYEAR
+    return {
+        "source_id": stars["source_id"].to_numpy(),
+        "ra": ra,
+        "dec": dec,
+        "pmra": pmra,
+        "pmdec": pmdec,
+        "g_mag": g_mag,
+        "jmag": estimate_jmag(g_mag, bp_rp),
+        "ra_now": ra + pmra * years / 3.6e6 / np.cos(np.deg2rad(dec)),
+        "dec_now": dec + pmdec * years / 3.6e6,
     }

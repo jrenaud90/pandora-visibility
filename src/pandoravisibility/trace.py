@@ -92,6 +92,8 @@ ROLL_UNCERTAINTY_STEP = 0.1
 # 0.005-sigma grid is accurate to ~1e-6, far below any contamination tolerance.
 _NORMAL_GRID = np.linspace(-12.0, 12.0, 4801)
 _NORMAL_CDF = 0.5 * (1.0 + np.array([erf(x / np.sqrt(2.0)) for x in _NORMAL_GRID]))
+# Sources rendered per pass in render_roi (~10 MB of work arrays at 80 x 256)
+_RENDER_CHUNK = 64
 
 
 def trace_position_angle(roll_deg):
@@ -209,7 +211,10 @@ def contamination_vs_roll(roll_degs, field: dict, roi_x: int, roi_y: int):
         Rolls in degrees.
     field : dict
         Neighbors from ``star_field.query_field`` (``xi``, ``eta``,
-        ``flux_ratio``).
+        ``flux_ratio``). An extended neighbor, such as a planet, is a set of
+        entries sampling its light. An optional ``target_shape`` dict
+        (``xi``, ``eta``, ``weight`` summing to 1) samples an extended
+        target the same way; the default is a point at the pivot.
     roi_x, roi_y : int
         NIRDA ROI size; see ``roi_window``.
 
@@ -226,12 +231,25 @@ def contamination_vs_roll(roll_degs, field: dict, roi_x: int, roi_y: int):
     if xi.size == 0 or rows.size == 0:
         return np.zeros(rolls.size)
 
+    trace_pa = trace_position_angle(rolls)[:, np.newaxis]
     star_row, star_col = detector_offsets(
-        xi[np.newaxis, :],
-        eta[np.newaxis, :],
-        trace_position_angle(rolls)[:, np.newaxis],
+        xi[np.newaxis, :], eta[np.newaxis, :], trace_pa
     )
-    target_capture = lsf_cdf(col_high) - lsf_cdf(col_low)
+    shape = field.get("target_shape")
+    if shape is None:
+        target_capture = lsf_cdf(col_high) - lsf_cdf(col_low)
+    else:
+        # An extended target rotates with the roll, so the share of its own
+        # light inside the aperture depends on the roll too
+        _, shape_col = detector_offsets(
+            np.asarray(shape["xi"], dtype=float)[np.newaxis, :],
+            np.asarray(shape["eta"], dtype=float)[np.newaxis, :],
+            trace_pa,
+        )
+        target_capture = (
+            (lsf_cdf(col_high - shape_col) - lsf_cdf(col_low - shape_col))
+            * np.asarray(shape["weight"], dtype=float)
+        ).sum(axis=1, keepdims=True)
     weight = (
         flux_ratio[np.newaxis, :]
         * (lsf_cdf(col_high - star_col) - lsf_cdf(col_low - star_col))
@@ -299,8 +317,9 @@ def render_roi(field: dict, roll_deg: float, roi_x: int, roi_y: int):
     Parameters
     ----------
     field : dict
-        Neighbors from ``star_field.query_field``; the target is added at the
-        pivot.
+        Neighbors from ``star_field.query_field``. The target is added at the
+        pivot, as a point or, with a ``target_shape``, as its samples (see
+        ``contamination_vs_roll``).
     roll_deg : float
         Roll in degrees.
     roi_x, roi_y : int
@@ -312,19 +331,46 @@ def render_roi(field: dict, roll_deg: float, roi_x: int, roi_y: int):
         (roi_y, roi_x) image, row index first.
     """
     roi_window(roi_x, roi_y)  # validates that the ROI holds the pivot
+    shape = field.get("target_shape") or {"xi": [0.0], "eta": [0.0], "weight": [1.0]}
     star_row, star_col = detector_offsets(
-        np.append(0.0, field["xi"]),
-        np.append(0.0, field["eta"]),
+        np.concatenate(
+            [np.asarray(shape["xi"], float), np.asarray(field["xi"], float)]
+        ),
+        np.concatenate(
+            [np.asarray(shape["eta"], float), np.asarray(field["eta"], float)]
+        ),
         trace_position_angle(roll_deg),
     )
-    flux_ratio = np.append(1.0, field["flux_ratio"])
-    pixel_row = np.arange(roi_y)[:, np.newaxis, np.newaxis] - PIVOT_IN_ROI[0]
-    pixel_col = np.arange(roi_x)[np.newaxis, :, np.newaxis] - PIVOT_IN_ROI[1]
-    along = _normal_cdf(
-        (pixel_row - (star_row + TRACE_ROW_MIN)) / LSF_CORE_SIGMA
-    ) - _normal_cdf((pixel_row - (star_row + TRACE_ROW_MAX)) / LSF_CORE_SIGMA)
-    across = _lsf_density(pixel_col - star_col)
-    return (flux_ratio * along * across).sum(axis=2)
+    flux_ratio = np.concatenate(
+        [np.asarray(shape["weight"], float), np.asarray(field["flux_ratio"], float)]
+    )
+    # Only sources whose trace (with a few pixels of LSF) touches the ROI
+    pivot_row, pivot_col = PIVOT_IN_ROI
+    touches = (
+        (star_col > -pivot_col - 10)
+        & (star_col < roi_x - pivot_col + 10)
+        & (star_row + TRACE_ROW_MAX > -pivot_row - 5)
+        & (star_row + TRACE_ROW_MIN < roi_y - pivot_row + 5)
+    )
+    star_row, star_col, flux_ratio = (
+        star_row[touches],
+        star_col[touches],
+        flux_ratio[touches],
+    )
+
+    pixel_row = np.arange(roi_y)[:, np.newaxis, np.newaxis] - pivot_row
+    pixel_col = np.arange(roi_x)[np.newaxis, :, np.newaxis] - pivot_col
+    image = np.zeros((roi_y, roi_x))
+    # In chunks of sources: a planet sampled by thousands of points would
+    # otherwise need a (rows, columns, sources) array of gigabytes
+    for start in range(0, flux_ratio.size, _RENDER_CHUNK):
+        part = slice(start, start + _RENDER_CHUNK)
+        along = _normal_cdf(
+            (pixel_row - (star_row[part] + TRACE_ROW_MIN)) / LSF_CORE_SIGMA
+        ) - _normal_cdf((pixel_row - (star_row[part] + TRACE_ROW_MAX)) / LSF_CORE_SIGMA)
+        across = _lsf_density(pixel_col - star_col[part])
+        image += (flux_ratio[part] * along * across).sum(axis=2)
+    return image
 
 
 def plot_trace(
@@ -341,13 +387,16 @@ def plot_trace(
     The image is from ``render_roi`` on a log stretch; the dashed box is the
     extraction aperture and the title gives the roll and its robust
     worst-channel contamination (``robust_contamination``). Each neighbor
-    trace inside the ROI is labeled with its estimated J magnitude, written
-    along the trace at the middle of its visible part.
+    trace inside the ROI is labeled, written along the trace at the middle of
+    its visible part: with the field's ``label`` entry when it has a
+    ``label`` array (empty strings are left unlabeled, e.g. the samples of an
+    extended body), otherwise with its estimated J magnitude.
 
     Parameters
     ----------
     field : dict
-        Neighbors from ``star_field.query_field``.
+        Neighbors from ``star_field.query_field``, optionally with a
+        ``target_shape`` (see ``contamination_vs_roll``) and ``label``.
     roll : astropy.units.Quantity
         Spacecraft roll (angle).
     roi_x, roi_y : int
@@ -357,8 +406,7 @@ def plot_trace(
     title : str, optional
         Text placed before the roll and contamination in the title.
     label_neighbors : bool, optional
-        Label each neighbor trace in the ROI with its J magnitude (default
-        True). Needs the field's ``jmag``.
+        Label the neighbor traces in the ROI (default True).
 
     Returns
     -------
@@ -414,12 +462,17 @@ def plot_trace(
         row_low = np.clip(PIVOT_IN_ROI[0] + star_row + TRACE_ROW_MIN, 0, roi_y - 1)
         row_high = np.clip(PIVOT_IN_ROI[0] + star_row + TRACE_ROW_MAX, 0, roi_y - 1)
         in_roi = (column >= -0.5) & (column <= roi_x - 0.5) & (row_high > row_low)
+        labels = field.get("label")
+        if labels is None:
+            labels = [f"J={jmag:.1f}" for jmag in field["jmag"]]
         outline = [patheffects.withStroke(linewidth=1.5, foreground="black")]
         for index in np.flatnonzero(in_roi):
+            if not labels[index]:
+                continue
             ax.text(
                 column[index],
                 0.5 * (row_low[index] + row_high[index]),
-                f"J={field['jmag'][index]:.1f}",
+                labels[index],
                 color="white",
                 fontsize=6,
                 rotation=90,

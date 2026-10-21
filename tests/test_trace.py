@@ -497,3 +497,74 @@ class TestRollSearchWithTrace:
             Visibility(_LINE1, _LINE2, nirda_roi_y=100)
         vis = Visibility(_LINE1, _LINE2, nirda_roi_x=64, nirda_roi_y=200)
         assert (vis.nirda_roi_x, vis.nirda_roi_y) == (64, 200)
+
+
+class TestExtendedSources:
+    """Fields around non-Gaia targets, extended bodies and custom labels."""
+
+    def test_query_stars_measures_from_center(self, fake_gaia):
+        """No target is matched: every bright star in the cone is returned."""
+        ra0, dec0 = 10.0, 5.0
+        cos_dec = np.cos(np.deg2rad(dec0))
+        fake_gaia.catalog = _catalog(
+            [
+                (1, ra0 + 20 / 3600 / cos_dec, dec0, 0.0, 0.0, 9.0, 1.0),
+                (2, ra0, dec0 - 40 / 3600, 0.0, 0.0, 17.5, 1.0),  # too faint in J
+            ]
+        )
+        stars = star_field.query_stars(
+            SkyCoord(ra0, dec0, unit="deg"), Time(2016.0, format="jyear")
+        )
+        np.testing.assert_allclose(stars["xi"], [20.0], atol=1e-3)
+        np.testing.assert_allclose(stars["eta"], [0.0], atol=1e-3)
+        assert stars["jmag"].shape == (1,)
+
+    def test_point_target_shape_matches_default(self):
+        """A one-point target shape at the pivot is the default point target."""
+        field = _field([3.0, -20.0], [30.0, 10.0], [0.3, 0.1])
+        shaped = {**field, "target_shape": {"xi": [0.0], "eta": [0.0], "weight": [1.0]}}
+        rolls = np.arange(0.0, 360.0, 10.0)
+        np.testing.assert_allclose(
+            trace.contamination_vs_roll(rolls, shaped, 80, 256),
+            trace.contamination_vs_roll(rolls, field, 80, 256),
+        )
+
+    def test_extended_target_light_outside_aperture(self):
+        """Half the target's light far across the dispersion doubles the ratio."""
+        field = _field(0.0, 30 * trace.NIRDA_PIXEL_SCALE, 0.01)
+        far = 40 * trace.NIRDA_PIXEL_SCALE
+        shaped = {
+            **field,
+            "target_shape": {"xi": [0.0, far], "eta": [0.0, 0.0], "weight": [0.5, 0.5]},
+        }
+        point = trace.contamination_vs_roll([_NORTH_ROLL], field, 80, 256)
+        extended = trace.contamination_vs_roll([_NORTH_ROLL], shaped, 80, 256)
+        np.testing.assert_allclose(extended, 2 * point, rtol=1e-6)
+
+    def test_render_roi_is_linear_across_chunks(self):
+        """Many faint copies of a source render as one brighter source."""
+        position = (5 * trace.NIRDA_PIXEL_SCALE, 20 * trace.NIRDA_PIXEL_SCALE)
+        many = _field([position[0]] * 130, [position[1]] * 130, [0.01] * 130)
+        one = _field(position[0], position[1], 1.3)
+        np.testing.assert_allclose(
+            trace.render_roi(many, 30.0, 80, 256),
+            trace.render_roi(one, 30.0, 80, 256),
+            rtol=1e-9,
+            atol=1e-12,  # far tails reach subnormal floats, where rtol is noise
+        )
+
+    def test_plot_trace_uses_labels(self):
+        """A label array replaces the J labels; empty entries stay unlabeled."""
+        matplotlib = pytest.importorskip("matplotlib")
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        field = _field(
+            [0.0, 1.0],
+            [30 * trace.NIRDA_PIXEL_SCALE, 30 * trace.NIRDA_PIXEL_SCALE],
+            [0.2, 0.2],
+        )
+        field["label"] = ["Titan", ""]
+        ax = trace.plot_trace(field, _NORTH_ROLL * u.deg, 80, 256)
+        assert [text.get_text() for text in ax.texts] == ["Titan"]
+        plt.close("all")
