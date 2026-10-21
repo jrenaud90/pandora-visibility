@@ -336,6 +336,26 @@ class TestRendering:
             trace.plot_trace(field, 45.0, 80, 256)
         plt.close("all")
 
+    def test_plot_trace_labels_neighbors_in_roi(self):
+        """Neighbor traces inside the ROI get their J; ones outside do not."""
+        matplotlib = pytest.importorskip("matplotlib")
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        # One neighbor 30 px along the trace (in the ROI, J = 8 + 1.75), one
+        # 300 px across it (outside the 80 column ROI)
+        field = _field(
+            [0.0, 300 * trace.NIRDA_PIXEL_SCALE],
+            [30 * trace.NIRDA_PIXEL_SCALE, 0.0],
+            [0.2, 0.5],
+        )
+        roll = _NORTH_ROLL * u.deg
+        ax = trace.plot_trace(field, roll, 80, 256)
+        assert [text.get_text() for text in ax.texts] == ["J=9.7"]
+        ax = trace.plot_trace(field, roll, 80, 256, label_neighbors=False)
+        assert len(ax.texts) == 0
+        plt.close("all")
+
 
 class TestRollSearchWithTrace:
     """get_visibility(optimize_roll=True) with the trace check."""

@@ -327,12 +327,22 @@ def render_roi(field: dict, roll_deg: float, roi_x: int, roi_y: int):
     return (flux_ratio * along * across).sum(axis=2)
 
 
-def plot_trace(field: dict, roll, roi_x: int, roi_y: int, ax=None, title=None):
+def plot_trace(
+    field: dict,
+    roll,
+    roi_x: int,
+    roi_y: int,
+    ax=None,
+    title=None,
+    label_neighbors: bool = True,
+):
     """Plot the simulated NIRDA ROI at one roll, with the extraction aperture.
 
     The image is from ``render_roi`` on a log stretch; the dashed box is the
     extraction aperture and the title gives the roll and its robust
-    worst-channel contamination (``robust_contamination``).
+    worst-channel contamination (``robust_contamination``). Each neighbor
+    trace inside the ROI is labeled with its estimated J magnitude, written
+    along the trace at the middle of its visible part.
 
     Parameters
     ----------
@@ -346,6 +356,9 @@ def plot_trace(field: dict, roll, roi_x: int, roi_y: int, ax=None, title=None):
         Axes to draw on; a new figure is made when omitted.
     title : str, optional
         Text placed before the roll and contamination in the title.
+    label_neighbors : bool, optional
+        Label each neighbor trace in the ROI with its J magnitude (default
+        True). Needs the field's ``jmag``.
 
     Returns
     -------
@@ -353,6 +366,7 @@ def plot_trace(field: dict, roll, roi_x: int, roi_y: int, ax=None, title=None):
         The axes drawn on.
     """
     try:
+        import matplotlib.patheffects as patheffects
         import matplotlib.pyplot as plt
         from matplotlib.colors import LogNorm
         from matplotlib.patches import Rectangle
@@ -388,6 +402,31 @@ def plot_trace(field: dict, roll, roi_x: int, roi_y: int, ax=None, title=None):
             linestyle="--",
         )
     )
+    if label_neighbors and len(field["xi"]):
+        star_row, star_col = detector_offsets(
+            np.asarray(field["xi"]),
+            np.asarray(field["eta"]),
+            trace_position_angle(roll_deg),
+        )
+        # Image pixel coordinates of each trace: its column, and the rows it
+        # spans clipped to the ROI
+        column = PIVOT_IN_ROI[1] + star_col
+        row_low = np.clip(PIVOT_IN_ROI[0] + star_row + TRACE_ROW_MIN, 0, roi_y - 1)
+        row_high = np.clip(PIVOT_IN_ROI[0] + star_row + TRACE_ROW_MAX, 0, roi_y - 1)
+        in_roi = (column >= -0.5) & (column <= roi_x - 0.5) & (row_high > row_low)
+        outline = [patheffects.withStroke(linewidth=1.5, foreground="black")]
+        for index in np.flatnonzero(in_roi):
+            ax.text(
+                column[index],
+                0.5 * (row_low[index] + row_high[index]),
+                f"J={field['jmag'][index]:.1f}",
+                color="white",
+                fontsize=6,
+                rotation=90,
+                ha="center",
+                va="center",
+                path_effects=outline,
+            )
     prefix = f"{title}\n" if title else ""
     ax.set_title(f"{prefix}roll {roll_deg:.1f}°, c = {contamination:.1e}", fontsize=9)
     ax.set_xlabel("column")
