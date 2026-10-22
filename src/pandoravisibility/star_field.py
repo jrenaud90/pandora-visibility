@@ -9,6 +9,9 @@ be downloaded once; see the gaiaoffline README.
 J magnitudes are estimated from Gaia photometry alone (G and BP - RP), so a
 star missing from Gaia, or fainter than the database's G limit (G < 16 by
 default), is not in the field.
+
+``query_visible_field`` serves the wider VISDA (visible camera) field drawn by
+``visda.py`` from the same catalog, with Gaia photometry instead of J.
 """
 
 import os
@@ -20,7 +23,13 @@ from astropy.coordinates import SkyCoord
 from astropy.time import Time
 from gaiaoffline import Gaia
 
-__all__ = ["query_field", "query_stars", "estimate_jmag", "gnomonic_offsets"]
+__all__ = [
+    "query_field",
+    "query_stars",
+    "query_visible_field",
+    "estimate_jmag",
+    "gnomonic_offsets",
+]
 
 # =====================================================================================
 # Field selection
@@ -176,25 +185,8 @@ def query_field(target_coord: SkyCoord, time: Time):
         FIELD_RADIUS_ARCMIN / 60.0 + TARGET_MATCH_RADIUS_ARCSEC / 3600.0,
         epoch,
     )
-    pmra, pmdec, g_mag = stars["pmra"], stars["pmdec"], stars["g_mag"]
-
-    # Identify the target as the brightest star whose track passes near the
-    # coordinate. Offsets move linearly in time, p(t) = p_2016 + v (t - 2016),
-    # so the closest approach is at t* = 2016 - (p_2016 . v) / |v|^2, clamped
-    # to the span searched.
-    xi_gaia, eta_gaia = gnomonic_offsets(stars["ra"], stars["dec"], ra0, dec0)
-    speed_xi, speed_eta = pmra / 1000.0, pmdec / 1000.0  # arcsec per year
-    speed_sq = speed_xi**2 + speed_eta**2
-    with np.errstate(invalid="ignore", divide="ignore"):
-        closest = -(xi_gaia * speed_xi + eta_gaia * speed_eta) / speed_sq
-    closest = np.clip(
-        np.nan_to_num(closest),
-        TARGET_TRACK_START_JYEAR - GAIA_EPOCH_JYEAR,
-        max(epoch, GAIA_EPOCH_JYEAR) - GAIA_EPOCH_JYEAR,
-    )
-    miss = np.hypot(xi_gaia + speed_xi * closest, eta_gaia + speed_eta * closest)
-    near = np.flatnonzero(miss < TARGET_MATCH_RADIUS_ARCSEC)
-    if near.size == 0:
+    target = _match_target(stars, ra0, dec0, epoch)
+    if target is None:
         warnings.warn(
             f"No Gaia star passes within {TARGET_MATCH_RADIUS_ARCSEC:g} arcsec "
             f"of RA {ra0:.5f}, Dec {dec0:.5f} between "
@@ -203,7 +195,6 @@ def query_field(target_coord: SkyCoord, time: Time):
             stacklevel=2,
         )
         return None
-    target = near[np.argmin(g_mag[near])]
 
     # Offsets from the target, both at the observation epoch
     ra_now, dec_now, jmag = stars["ra_now"], stars["dec_now"], stars["jmag"]
@@ -262,6 +253,96 @@ def query_stars(center: SkyCoord, time: Time):
     return {"xi": xi[keep], "eta": eta[keep], "jmag": stars["jmag"][keep]}
 
 
+def query_visible_field(
+    target_coord: SkyCoord, time: Time, radius_arcmin: float, match_target=True
+):
+    """Gaia stars for a VISDA (visible camera) field, at the observation epoch.
+
+    Unlike ``query_field``, every star in the cone is returned whatever its
+    brightness (down to the database's G limit) and the target is included.
+    The target is matched as in ``query_field``; when no Gaia star matches (a
+    bare coordinate), or ``match_target`` is False (a solar system body, which
+    must not be swapped for a star near it), offsets are measured from
+    ``target_coord`` instead, without a warning.
+
+    Parameters
+    ----------
+    target_coord : SkyCoord
+        Target position (scalar); see ``query_field``.
+    time : astropy.time.Time
+        Observation time(s); their mean sets the epoch.
+    radius_arcmin : float
+        Cone radius about the target, in arcmin.
+    match_target : bool, optional
+        Look for the target among the Gaia stars (default True).
+
+    Returns
+    -------
+    dict
+        xi, eta : np.ndarray
+            (n,) offsets from the target (or ``target_coord``) in arcsec,
+            east and north.
+        g_mag, bp_mag, bp_rp : np.ndarray
+            (n,) Gaia G, BP and BP - RP; NaN where Gaia has none.
+        is_target : np.ndarray
+            (n,) bool, True for the matched target (all False if none).
+
+    Raises
+    ------
+    FileNotFoundError
+        If the gaiaoffline database is not installed.
+    """
+    ra0 = float(target_coord.icrs.ra.deg)
+    dec0 = float(target_coord.icrs.dec.deg)
+    epoch = float(np.mean(np.atleast_1d(time.jyear)))
+    stars = _read_cone(
+        ra0, dec0, radius_arcmin / 60.0 + TARGET_MATCH_RADIUS_ARCSEC / 3600.0, epoch
+    )
+    target = _match_target(stars, ra0, dec0, epoch) if match_target else None
+    ra_now, dec_now = stars["ra_now"], stars["dec_now"]
+    if target is None:
+        xi, eta = gnomonic_offsets(ra_now, dec_now, ra0, dec0)
+    else:
+        xi, eta = gnomonic_offsets(ra_now, dec_now, ra_now[target], dec_now[target])
+    is_target = np.arange(len(xi)) == (-1 if target is None else target)
+    keep = np.hypot(xi, eta) <= radius_arcmin * 60.0
+    return {
+        "xi": xi[keep],
+        "eta": eta[keep],
+        "g_mag": stars["g_mag"][keep],
+        "bp_mag": stars["bp_mag"][keep],
+        "bp_rp": stars["bp_rp"][keep],
+        "is_target": is_target[keep],
+    }
+
+
+def _match_target(stars, ra0, dec0, epoch):
+    """Index in ``stars`` of the target at (ra0, dec0), or None.
+
+    The target is the brightest star whose proper-motion track passes within
+    ``TARGET_MATCH_RADIUS_ARCSEC`` of the coordinate between
+    ``TARGET_TRACK_START_JYEAR`` and ``epoch``.
+    """
+    # Offsets move linearly in time, p(t) = p_2016 + v (t - 2016), so the
+    # closest approach is at t* = 2016 - (p_2016 . v) / |v|^2, clamped to the
+    # span searched.
+    xi_gaia, eta_gaia = gnomonic_offsets(stars["ra"], stars["dec"], ra0, dec0)
+    speed_xi, speed_eta = stars["pmra"] / 1000.0, stars["pmdec"] / 1000.0  # "/yr
+    speed_sq = speed_xi**2 + speed_eta**2
+    with np.errstate(invalid="ignore", divide="ignore"):
+        closest = -(xi_gaia * speed_xi + eta_gaia * speed_eta) / speed_sq
+    closest = np.clip(
+        np.nan_to_num(closest),
+        TARGET_TRACK_START_JYEAR - GAIA_EPOCH_JYEAR,
+        max(epoch, GAIA_EPOCH_JYEAR) - GAIA_EPOCH_JYEAR,
+    )
+    miss = np.hypot(xi_gaia + speed_xi * closest, eta_gaia + speed_eta * closest)
+    near = np.flatnonzero(miss < TARGET_MATCH_RADIUS_ARCSEC)
+    if near.size == 0:
+        return None
+    return near[np.argmin(stars["g_mag"][near])]
+
+
 def _read_cone(ra0, dec0, radius_deg, epoch):
     """Gaia stars in a cone, with J estimates and positions at ``epoch``.
 
@@ -273,7 +354,7 @@ def _read_cone(ra0, dec0, radius_deg, epoch):
     -------
     dict of np.ndarray
         source_id, ra, dec (J2016, deg), pmra, pmdec (mas/yr, NaN as 0),
-        g_mag, jmag, and ra_now, dec_now (deg at ``epoch``).
+        g_mag, bp_mag, bp_rp, jmag, and ra_now, dec_now (deg at ``epoch``).
 
     Raises
     ------
@@ -288,9 +369,8 @@ def _read_cone(ra0, dec0, radius_deg, epoch):
     pmra = np.nan_to_num(stars["pmra"].to_numpy(dtype=float))  # includes cos(dec)
     pmdec = np.nan_to_num(stars["pmdec"].to_numpy(dtype=float))
     g_mag = stars["phot_g_mean_mag"].to_numpy(dtype=float)
-    bp_rp = (stars["phot_bp_mean_mag"] - stars["phot_rp_mean_mag"]).to_numpy(
-        dtype=float
-    )
+    bp_mag = stars["phot_bp_mean_mag"].to_numpy(dtype=float)
+    bp_rp = bp_mag - stars["phot_rp_mean_mag"].to_numpy(dtype=float)
     years = epoch - GAIA_EPOCH_JYEAR
     return {
         "source_id": stars["source_id"].to_numpy(),
@@ -299,6 +379,8 @@ def _read_cone(ra0, dec0, radius_deg, epoch):
         "pmra": pmra,
         "pmdec": pmdec,
         "g_mag": g_mag,
+        "bp_mag": bp_mag,
+        "bp_rp": bp_rp,
         "jmag": estimate_jmag(g_mag, bp_rp),
         "ra_now": ra + pmra * years / 3.6e6 / np.cos(np.deg2rad(dec)),
         "dec_now": dec + pmdec * years / 3.6e6,

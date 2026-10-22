@@ -10,5 +10,8 @@ By default `Visibility.get_visibility(..., optimize_roll=True)` also rejects rol
 
 The check takes `trace_contamination_tol` (default 1e-3, contaminating over target flux in the worst spectral channel), `nirda_roi_x` and `nirda_roi_y` (default 80 x 256). Every other model setting (roll-to-detector mapping, trace extent, aperture, line-spread function, roll uncertainty, catalog depth) is a module constant at the top of `trace.py` or `star_field.py`. `trace.plot_trace` draws the simulated subarray at a given roll.
 
+### Simulated VISDA star field
+`visda.plot_visible_field` draws what the visible camera (VISDA) would see in one uncoadded 0.2 s frame at a given roll: the Gaia stars from `star_field.query_visible_field` (same gaiaoffline catalog), in the VisSci detector frame, with a red box on the target and a blue box on the field center. The field size (default 1056 x 1056 px), the target's pixel, both box sizes and the BP magnitude limit (default 16) are keyword arguments. The camera model (pixel scale, roll-to-detector mapping, Gaia-to-counts photometry, PSF, noise and saturation) is a set of module constants at the top of `visda.py`, calibrated on VisSci data from orbit. Both docs notebooks end with these fields.
+
 ### Acknowledgements
 This project incorporates code from [m4opt](https://github.com/m4opt/m4opt/), which is licensed under the BSD 3-Clause License.

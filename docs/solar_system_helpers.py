@@ -11,7 +11,8 @@ Four groups of functions live here:
 * sampling extended bodies (an oblate planet disk and Saturn's main rings) as
   point sources, so ``pandoravisibility.trace`` can draw and score them;
 * the NIRDA field around a target at one time step: the other bodies of its
-  system plus Gaia field stars.
+  system plus Gaia field stars;
+* the same for the VISDA (visible camera) field, for ``pandoravisibility.visda``.
 
 The ephemerides are geocentric. Pandora's ~7,000 km offset from the Earth's
 center moves every body of a planetary system by the same ~1 arcsec, so the
@@ -83,6 +84,11 @@ RING_RELATIVE_BRIGHTNESS = 1.0
 #: V - SOLAR_V_MINUS_J. Methane bands make Saturn, Titan, Uranus and Neptune
 #: fainter in the near infrared than this suggests.
 SOLAR_V_MINUS_J = 1.15
+
+#: The Sun's Gaia BP - RP and G - V (the Riello et al. 2021 G - V relation at
+#: that color), for drawing sunlit bodies on VISDA.
+SOLAR_BP_RP = 0.82
+SOLAR_G_MINUS_V = -0.15
 
 #: Spacing of the point samples of an extended body, in arcsec (half a pixel).
 SAMPLE_SPACING = 0.6
@@ -483,4 +489,85 @@ def system_field(target_id, ephemerides, index, time, labels, include_stars=True
         "jmag": np.concatenate(jmag) if jmag else np.array([]),
         "label": label,
         "target_shape": {"xi": shape_xi, "eta": shape_eta, "weight": shape_weight},
+    }
+
+
+def system_visible_sources(
+    target_id, ephemerides, index, time, labels, radius_arcmin, include_stars=True
+):
+    """
+    VISDA sources around a target at one time step, for ``visda.plot_visible_field``.
+
+    Every body of the target's system that is not hidden (occulted or fully
+    eclipsed, see ``HIDDEN_CODES``), the target included, sampled as in
+    ``body_samples``, plus Gaia field stars from
+    ``star_field.query_visible_field``. Bodies take G = V +
+    ``SOLAR_G_MINUS_V`` and BP - RP = ``SOLAR_BP_RP``.
+
+    Parameters
+    ----------
+    target_id : int
+        Horizons id of the body the field is centered on.
+    ephemerides : dict
+        From ``system_ephemerides``.
+    index : int
+        Time step.
+    time : astropy.time.Time
+        That time step, for the stars' proper motion.
+    labels : dict
+        Horizons id -> display name.
+    radius_arcmin : float
+        Star cone radius, e.g. from ``visda.field_radius_arcmin``.
+    include_stars : bool
+        Add Gaia field stars (needs the gaiaoffline database).
+
+    Returns
+    -------
+    dict
+        ``xi``, ``eta``, ``g_mag``, ``bp_mag``, ``bp_rp``, ``weight`` and
+        ``label`` per source, in the format ``visda.render_frame`` takes.
+        Stars are labeled with their BP when brighter than 12.
+    """
+    target = ephemerides[target_id]
+    ra0, dec0 = target["ra"][index], target["dec"][index]
+
+    xi, eta, g_mag, bp_mag, bp_rp, weight, label = [], [], [], [], [], [], []
+    for body_id in system_ids(target_id):
+        body = ephemerides[body_id]
+        if body_id != target_id and body["code"][index] in HIDDEN_CODES:
+            continue
+        center_xi, center_eta = star_field.gnomonic_offsets(
+            body["ra"][index], body["dec"][index], ra0, dec0
+        )
+        dxi, deta, body_weight = body_samples(body_id, body, index)
+        xi.append(center_xi + dxi)
+        eta.append(center_eta + deta)
+        g_mag.append(np.full(body_weight.size, body["vmag"][index] + SOLAR_G_MINUS_V))
+        bp_mag.append(np.full(body_weight.size, np.nan))
+        bp_rp.append(np.full(body_weight.size, SOLAR_BP_RP))
+        weight.append(body_weight)
+        label.extend([labels[body_id]] + [""] * (body_weight.size - 1))
+
+    if include_stars:
+        stars = star_field.query_visible_field(
+            SkyCoord(ra0, dec0, unit="deg"), time, radius_arcmin, match_target=False
+        )
+        xi.append(stars["xi"])
+        eta.append(stars["eta"])
+        g_mag.append(stars["g_mag"])
+        bp_mag.append(stars["bp_mag"])
+        bp_rp.append(stars["bp_rp"])
+        weight.append(np.ones(stars["xi"].size))
+        label.extend(
+            f"BP={value:.1f}" if value < 12.0 else "" for value in stars["bp_mag"]
+        )
+
+    return {
+        "xi": np.concatenate(xi),
+        "eta": np.concatenate(eta),
+        "g_mag": np.concatenate(g_mag),
+        "bp_mag": np.concatenate(bp_mag),
+        "bp_rp": np.concatenate(bp_rp),
+        "weight": np.concatenate(weight),
+        "label": label,
     }

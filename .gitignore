@@ -164,3 +164,6 @@ cython_debug/
 .DS_Store
 .continue/
 .vscode/
+
+# Per-target CSVs written by the docs notebooks
+docs/*.csv

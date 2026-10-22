@@ -200,6 +200,49 @@ class TestStarField:
             )
         assert field is None
 
+    def test_query_visible_field_keeps_target_and_faint_stars(self, fake_gaia):
+        """VISDA fields include the target and stars too faint in J for NIRDA."""
+        ra0, dec0 = 120.0, -10.0
+        fake_gaia.catalog = _catalog(
+            [
+                (1, ra0, dec0, 0.0, 1000.0, 9.0, 1.0),  # target moving 1"/yr north
+                (2, ra0, dec0 + 60 / 3600, 0.0, 0.0, 15.8, 1.0),  # J ~ 14.6
+                (3, ra0, dec0 + 9.0 / 60, 0.0, 0.0, 10.0, 1.0),  # beyond 8 arcmin
+            ]
+        )
+        stars = star_field.query_visible_field(
+            SkyCoord(ra0, dec0, unit="deg"), Time(2026.0, format="jyear"), 8.0
+        )
+        np.testing.assert_array_equal(stars["is_target"], [True, False])
+        np.testing.assert_allclose(stars["eta"], [0.0, 50.0], atol=1e-3)
+        np.testing.assert_allclose(stars["bp_rp"], [1.0, 1.0])
+        np.testing.assert_allclose(stars["bp_mag"], [9.5, 16.3])
+
+    def test_query_visible_field_without_target(self, fake_gaia):
+        """With no Gaia target, offsets are from the coordinate and no warning."""
+        ra0, dec0 = 200.0, 40.0
+        fake_gaia.catalog = _catalog([(2, ra0, dec0 + 30 / 3600, 0.0, 0.0, 10.0, 1.0)])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            stars = star_field.query_visible_field(
+                SkyCoord(ra0, dec0, unit="deg"), Time(2016.0, format="jyear"), 5.0
+            )
+        assert not stars["is_target"].any()
+        np.testing.assert_allclose(stars["eta"], [30.0], atol=1e-3)
+
+    def test_query_visible_field_match_target_off(self, fake_gaia):
+        """A planet's coordinate is kept even with a star within the match radius."""
+        ra0, dec0 = 200.0, 40.0
+        fake_gaia.catalog = _catalog([(2, ra0, dec0 + 5 / 3600, 0.0, 0.0, 10.0, 1.0)])
+        stars = star_field.query_visible_field(
+            SkyCoord(ra0, dec0, unit="deg"),
+            Time(2016.0, format="jyear"),
+            5.0,
+            match_target=False,
+        )
+        assert not stars["is_target"].any()
+        np.testing.assert_allclose(stars["eta"], [5.0], atol=1e-3)
+
     @pytest.mark.skipif(
         not os.path.isfile(gaiaoffline.DATABASEPATH)
         or os.path.getsize(gaiaoffline.DATABASEPATH) == 0,
